@@ -12,6 +12,18 @@ DB_PATH = APP_DIR / "locacoes.db"
 LOGO_PATH = APP_DIR / "IMG_0207.png"
 ATTACHED_LOGO_PATH = APP_DIR / "attached_assets" / "IMG_0207_1789499383772.png"
 
+# Lista de obras ativas
+OBRAS = ["CASA RIMAR", "CASA IM", "REFORMA GV", "HBR"]
+
+# Origens/Fornecedores pré-definidos
+FORNECEDORES_PADRAO = [
+    "Equipamento CM (Próprio)",
+    "HL Locações",
+    "Loc Express",
+    "Escan",
+    "Outro (especificar)"
+]
+
 
 def get_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
@@ -32,24 +44,34 @@ def init_db() -> None:
                 data_devolucao TEXT NOT NULL,
                 custo_diario REAL NOT NULL CHECK (custo_diario >= 0),
                 status TEXT NOT NULL DEFAULT 'Ativa',
-                data_baixa TEXT
+                data_baixa TEXT,
+                tipo_origem TEXT DEFAULT 'Terceiros'
             )
             """
         )
+        # Garante migração caso a coluna tipo_origem não exista ainda
+        cursor = connection.execute("PRAGMA table_info(locacoes)")
+        colunas = [col[1] for col in cursor.fetchall()]
+        if "tipo_origem" not in colunas:
+            connection.execute("ALTER TABLE locacoes ADD COLUMN tipo_origem TEXT DEFAULT 'Terceiros'")
         connection.commit()
 
 
 def load_rentals() -> pd.DataFrame:
     with get_connection() as connection:
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             "SELECT * FROM locacoes ORDER BY date(data_devolucao), id DESC",
             connection,
         )
+        if "tipo_origem" not in df.columns:
+            df["tipo_origem"] = "Terceiros"
+        return df
 
 
 def create_rental(
     equipamento: str,
     fornecedor: str,
+    tipo_origem: str,
     obra: str,
     data_retirada: date,
     data_devolucao: date,
@@ -59,12 +81,13 @@ def create_rental(
         connection.execute(
             """
             INSERT INTO locacoes
-                (equipamento, fornecedor, obra, data_retirada, data_devolucao, custo_diario)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (equipamento, fornecedor, tipo_origem, obra, data_retirada, data_devolucao, custo_diario)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 equipamento.strip(),
                 fornecedor.strip(),
+                tipo_origem,
                 obra.strip(),
                 data_retirada.isoformat(),
                 data_devolucao.isoformat(),
@@ -122,14 +145,18 @@ def deadline_label(row: pd.Series) -> str:
     return f"{days} dia(s) restante(s)"
 
 
-def logo_path() -> Path:
+def logo_path() -> Path | None:
     if LOGO_PATH.exists():
         return LOGO_PATH
-    return ATTACHED_LOGO_PATH
+    if ATTACHED_LOGO_PATH.exists():
+        return ATTACHED_LOGO_PATH
+    return None
 
 
 def render_sidebar() -> str:
-    st.sidebar.image(str(logo_path()), use_container_width=True)
+    img = logo_path()
+    if img:
+        st.sidebar.image(str(img), use_container_width=True)
     st.sidebar.markdown("### CM Rental")
     st.sidebar.caption("Controle de locação de equipamentos")
     st.sidebar.divider()
@@ -138,9 +165,9 @@ def render_sidebar() -> str:
         ["Nova Locação", "Equipamentos Alugados", "Dashboard"],
     )
     st.sidebar.divider()
-    active_count = int((load_rentals()["status"] == "Ativa").sum())
+    rentals = load_rentals()
+    active_count = int((rentals["status"] == "Ativa").sum()) if not rentals.empty else 0
     st.sidebar.metric("Locações ativas", active_count)
-    st.sidebar.caption("Dados armazenados localmente em SQLite.")
     
     st.sidebar.divider()
     st.sidebar.markdown("👤 **Guilherme Macedo de Araújo Matias da Costa**")
@@ -151,42 +178,54 @@ def render_sidebar() -> str:
 
 def render_new_rental() -> None:
     st.title("Nova Locação")
-    st.write("Registre a retirada de um equipamento e acompanhe o custo da operação.")
+    st.write("Registre a movimentação de um equipamento (próprio ou terceiro).")
 
     with st.form("new_rental_form", clear_on_submit=True):
         col_one, col_two = st.columns(2)
         with col_one:
             equipamento = st.text_input(
                 "Equipamento",
-                placeholder="Ex.: Betoneira 400L",
+                placeholder="Ex.: Betoneira 400L, Martelete 15kg",
             )
-            fornecedor = st.text_input(
-                "Fornecedor",
-                placeholder="Ex.: CM Rental",
+            
+            origem_sel = st.selectbox(
+                "Origem do Equipamento / Fornecedor",
+                FORNECEDORES_PADRAO,
+                help="Selecione se é equipamento CM (próprio) ou locação de parceiro."
             )
+            
+            fornecedor_custom = ""
+            if origem_sel == "Outro (especificar)":
+                fornecedor_custom = st.text_input("Digite o nome do fornecedor:")
+            
             obra = st.selectbox(
                 "Obra de destino",
-                ["CASA RIMAR", "CASA IM", "REFORMA GV", "HBR"]
+                OBRAS
             )
+            
             custo_diario = st.number_input(
                 "Custo diário (R$)",
                 min_value=0.0,
-                step=10.0,
+                step=5.0,
                 format="%.2f",
+                help="Para equipamentos próprios, você pode lançar o custo interno/depreciação ou R$ 0,00."
             )
+            
         with col_two:
             data_retirada = st.date_input(
-                "Data de retirada",
+                "Data de retirada / início",
                 value=date.today(),
                 format="DD/MM/YYYY",
             )
             data_devolucao = st.date_input(
-                "Data de devolução",
+                "Previsão de devolução",
                 value=date.today() + timedelta(days=7),
                 format="DD/MM/YYYY",
             )
             st.info(
-                "O prazo, o custo acumulado e os atrasos serão calculados automaticamente."
+                "📌 **Classificação:**\n"
+                "- **Equipamento CM:** Equipamento Próprio.\n"
+                "- **HL Locações, Loc Express, Escan:** Locação Terceirizada."
             )
 
         submitted = st.form_submit_button(
@@ -196,49 +235,61 @@ def render_new_rental() -> None:
         )
 
     if submitted:
-        if not equipamento.strip() or not fornecedor.strip():
-            st.error("Preencha equipamento e fornecedor.")
+        # Define fornecedor final e tipo
+        if origem_sel == "Outro (especificar)":
+            fornecedor_final = fornecedor_custom.strip() if fornecedor_custom.strip() else "Outro"
+            tipo_origem = "Terceiros"
+        elif origem_sel == "Equipamento CM (Próprio)":
+            fornecedor_final = "CM (Próprio)"
+            tipo_origem = "Próprio (CM)"
+        else:
+            fornecedor_final = origem_sel
+            tipo_origem = "Terceiros"
+
+        if not equipamento.strip():
+            st.error("Informe o nome do equipamento.")
         elif data_devolucao < data_retirada:
             st.error("A data de devolução deve ser igual ou posterior à retirada.")
         else:
             create_rental(
-                equipamento,
-                fornecedor,
-                obra,
-                data_retirada,
-                data_devolucao,
-                custo_diario,
+                equipamento=equipamento,
+                fornecedor=fornecedor_final,
+                tipo_origem=tipo_origem,
+                obra=obra,
+                data_retirada=data_retirada,
+                data_devolucao=data_devolucao,
+                custo_diario=custo_diario,
             )
-            st.success("Locação registrada com sucesso.")
+            st.success(f"Equipamento '{equipamento}' ({tipo_origem}) registrado com sucesso!")
             st.rerun()
 
 
 def render_active_rentals() -> None:
-    st.title("Equipamentos Alugados")
-    st.write("Acompanhe prazos de devolução, atrasos e locações em andamento.")
+    st.title("Equipamentos em Uso / Alugados")
+    st.write("Acompanhe prazos de devolução, origem e locações ativas por obra.")
 
     rentals = load_rentals()
     active = rentals[rentals["status"] == "Ativa"].copy()
     if active.empty:
-        st.info("Não há equipamentos alugados no momento.")
+        st.info("Não há equipamentos ativos no momento.")
         return
 
     overdue_count = sum(
         as_date(row["data_devolucao"]) < date.today()
         for _, row in active.iterrows()
     )
-    metric_one, metric_two, metric_three = st.columns(3)
-    metric_one.metric("Equipamentos ativos", len(active))
-    metric_two.metric("Em atraso", overdue_count)
-    metric_three.metric(
-        "Custo diário",
-        format_currency(float(active["custo_diario"].sum())),
-    )
+    
+    metric_one, metric_two, metric_three, metric_four = st.columns(4)
+    metric_one.metric("Total em Uso", len(active))
+    metric_two.metric("Próprios (CM)", int((active["tipo_origem"] == "Próprio (CM)").sum()))
+    metric_three.metric("Terceirizados", int((active["tipo_origem"] == "Terceiros").sum()))
+    metric_four.metric("Em atraso", overdue_count)
 
     table = active[
         [
             "id",
             "equipamento",
+            "tipo_origem",
             "fornecedor",
             "obra",
             "data_retirada",
@@ -249,6 +300,7 @@ def render_active_rentals() -> None:
     table.columns = [
         "ID",
         "Equipamento",
+        "Origem",
         "Fornecedor",
         "Obra",
         "Retirada",
@@ -261,30 +313,28 @@ def render_active_rentals() -> None:
     table["Prazo"] = active.apply(deadline_label, axis=1).values
     st.dataframe(table, hide_index=True, use_container_width=True)
 
-    st.subheader("Dar baixa em uma devolução")
+    st.subheader("Dar baixa em devolução")
     rental_options = {
-        f'{row["equipamento"]} · {row["obra"]} · devolução {format_date(row["data_devolucao"])}': int(
-            row["id"]
-        )
+        f'#{row["id"]} · {row["equipamento"]} ({row["fornecedor"]}) · {row["obra"]}': int(row["id"])
         for _, row in active.iterrows()
     }
     selected_label = st.selectbox(
-        "Selecione a locação devolvida",
+        "Selecione o equipamento devolvido / desmobilizado",
         list(rental_options.keys()),
     )
     if st.button("Dar Baixa", type="primary"):
         close_rental(rental_options[selected_label])
-        st.success("Equipamento marcado como devolvido.")
+        st.success("Equipamento desmobilizado/devolvido com sucesso!")
         st.rerun()
 
 
 def render_dashboard() -> None:
-    st.title("Dashboard")
-    st.write("Visão financeira das locações de equipamentos por obra.")
+    st.title("Dashboard de Custos e Frentes")
+    st.write("Análise de custos de locação por obra e por fornecedor.")
 
     rentals = load_rentals()
     if rentals.empty:
-        st.info("Registre uma locação para começar a visualizar o dashboard.")
+        st.info("Cadastre a primeira locação para habilitar os relatórios do dashboard.")
         return
 
     rentals["dias_cobrados"] = rentals.apply(rental_days, axis=1)
@@ -292,33 +342,40 @@ def render_dashboard() -> None:
     active = rentals[rentals["status"] == "Ativa"]
 
     total_cost_value = float(rentals["custo_total"].sum())
-    daily_cost = float(active["custo_diario"].sum()) if not active.empty else 0.0
-    overdue = (
-        int((active["data_devolucao"].map(as_date) < date.today()).sum())
-        if not active.empty
-        else 0
-    )
-    metric_one, metric_two, metric_three = st.columns(3)
-    metric_one.metric("Custo total", format_currency(total_cost_value))
-    metric_two.metric("Custo diário ativo", format_currency(daily_cost))
-    metric_three.metric("Locações em atraso", overdue)
+    daily_cost_active = float(active["custo_diario"].sum()) if not active.empty else 0.0
 
-    st.subheader("Custo total por obra")
-    by_work = (
-        rentals.groupby("obra", as_index=True)["custo_total"]
-        .sum()
-        .sort_values(ascending=False)
-        .to_frame("Custo total")
-    )
-    st.bar_chart(by_work, color="#F35A24")
+    col1, col2 = st.columns(2)
+    col1.metric("Custo Total Acumulado", format_currency(total_cost_value))
+    col2.metric("Custo Diário Ativo (Dia)", format_currency(daily_cost_active))
 
-    chart_table = by_work.reset_index()
-    chart_table["Custo total"] = chart_table["Custo total"].map(format_currency)
-    st.dataframe(chart_table, hide_index=True, use_container_width=True)
-    st.caption(
-        "Para locações ativas, o valor considera os dias já utilizados. "
-        "Para locações devolvidas, considera o período até a baixa."
-    )
+    st.divider()
+    col_g1, col_g2 = st.columns(2)
+
+    with col_g1:
+        st.subheader("Custo Total por Obra")
+        by_work = (
+            rentals.groupby("obra")["custo_total"]
+            .sum()
+            .sort_values(ascending=False)
+            .to_frame("Custo Total")
+        )
+        st.bar_chart(by_work, color="#F35A24")
+
+    with col_g2:
+        st.subheader("Custo por Fornecedor / Origem")
+        by_supplier = (
+            rentals.groupby("fornecedor")["custo_total"]
+            .sum()
+            .sort_values(ascending=False)
+            .to_frame("Custo Total")
+        )
+        st.bar_chart(by_supplier, color="#1F77B4")
+
+    st.subheader("Detalhamento Geral")
+    resumo_df = rentals.groupby(["obra", "fornecedor", "tipo_origem"])["custo_total"].sum().reset_index()
+    resumo_df.columns = ["Obra", "Fornecedor", "Tipo", "Custo Total"]
+    resumo_df["Custo Total"] = resumo_df["Custo Total"].map(format_currency)
+    st.dataframe(resumo_df, hide_index=True, use_container_width=True)
 
 
 def main() -> None:
