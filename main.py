@@ -33,6 +33,7 @@ def get_connection() -> sqlite3.Connection:
 
 def init_db() -> None:
     with get_connection() as connection:
+        # Tabela de Locações
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS locacoes (
@@ -45,15 +46,33 @@ def init_db() -> None:
                 custo_diario REAL NOT NULL CHECK (custo_diario >= 0),
                 status TEXT NOT NULL DEFAULT 'Ativa',
                 data_baixa TEXT,
-                tipo_origem TEXT DEFAULT 'Terceiros'
+                tipo_origem TEXT DEFAULT 'Terceiros',
+                custo_mensal REAL DEFAULT 0,
+                limite_dias INTEGER DEFAULT 15
             )
             """
         )
-        # Garante migração caso a coluna tipo_origem não exista ainda
+        # Atualização automática do banco (Migrations)
         cursor = connection.execute("PRAGMA table_info(locacoes)")
         colunas = [col[1] for col in cursor.fetchall()]
         if "tipo_origem" not in colunas:
             connection.execute("ALTER TABLE locacoes ADD COLUMN tipo_origem TEXT DEFAULT 'Terceiros'")
+        if "custo_mensal" not in colunas:
+            connection.execute("ALTER TABLE locacoes ADD COLUMN custo_mensal REAL DEFAULT 0")
+        if "limite_dias" not in colunas:
+            connection.execute("ALTER TABLE locacoes ADD COLUMN limite_dias INTEGER DEFAULT 15")
+            
+        # Nova Tabela de Patrimônio (Equipamentos da Empresa)
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS patrimonio (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                equipamento TEXT NOT NULL UNIQUE,
+                valor_aquisicao REAL NOT NULL DEFAULT 0,
+                data_aquisicao TEXT NOT NULL
+            )
+            """
+        )
         connection.commit()
 
 
@@ -63,9 +82,33 @@ def load_rentals() -> pd.DataFrame:
             "SELECT * FROM locacoes ORDER BY date(data_devolucao), id DESC",
             connection,
         )
+        # Garantia de retrocompatibilidade para dados antigos
         if "tipo_origem" not in df.columns:
             df["tipo_origem"] = "Terceiros"
+        if "custo_mensal" not in df.columns:
+            df["custo_mensal"] = 0.0
+        if "limite_dias" not in df.columns:
+            df["limite_dias"] = 15
         return df
+
+
+def load_patrimonio() -> pd.DataFrame:
+    with get_connection() as connection:
+        return pd.read_sql_query("SELECT * FROM patrimonio ORDER BY id DESC", connection)
+
+
+def create_patrimonio(equipamento: str, valor: float, data_aquisicao: date) -> bool:
+    with get_connection() as connection:
+        try:
+            connection.execute(
+                "INSERT INTO patrimonio (equipamento, valor_aquisicao, data_aquisicao) VALUES (?, ?, ?)",
+                (equipamento.strip(), valor, data_aquisicao.isoformat())
+            )
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Se o nome já existir, bloqueia duplicidade
+            return False
 
 
 def create_rental(
@@ -76,13 +119,15 @@ def create_rental(
     data_retirada: date,
     data_devolucao: date,
     custo_diario: float,
+    custo_mensal: float,
+    limite_dias: int,
 ) -> None:
     with get_connection() as connection:
         connection.execute(
             """
             INSERT INTO locacoes
-                (equipamento, fornecedor, tipo_origem, obra, data_retirada, data_devolucao, custo_diario)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (equipamento, fornecedor, tipo_origem, obra, data_retirada, data_devolucao, custo_diario, custo_mensal, limite_dias)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 equipamento.strip(),
@@ -92,6 +137,8 @@ def create_rental(
                 data_retirada.isoformat(),
                 data_devolucao.isoformat(),
                 custo_diario,
+                custo_mensal,
+                limite_dias
             ),
         )
         connection.commit()
@@ -125,7 +172,25 @@ def rental_days(row: pd.Series, reference_day: date | None = None) -> int:
 
 
 def total_cost(row: pd.Series) -> float:
-    return rental_days(row) * float(row["custo_diario"])
+    days = rental_days(row)
+    diario = float(row.get("custo_diario", 0.0))
+    mensal = float(row.get("custo_mensal", 0.0))
+    limite = int(row.get("limite_dias", 15))
+
+    # Regra: Se tem custo mensal cadastrado, aplica a lógica do "virou mês"
+    if mensal > 0:
+        meses_cheios = days // 30
+        dias_sobra = days % 30
+        
+        # Se os dias quebrados passarem do limite, cobra um mês cheio adicional
+        if dias_sobra >= limite:
+            meses_cheios += 1
+            dias_sobra = 0
+            
+        return (meses_cheios * mensal) + (dias_sobra * diario)
+    
+    # Se não tem mensal, cobra estritamente por diária
+    return days * diario
 
 
 def format_currency(value: float) -> str:
@@ -158,11 +223,11 @@ def render_sidebar() -> str:
     if img:
         st.sidebar.image(str(img), use_container_width=True)
     st.sidebar.markdown("### CM Rental")
-    st.sidebar.caption("Controle de locação de equipamentos")
+    st.sidebar.caption("Gestão Estratégica de Locações")
     st.sidebar.divider()
     menu = st.sidebar.radio(
-        "Menu principal",
-        ["Nova Locação", "Equipamentos Alugados", "Dashboard"],
+        "Navegação",
+        ["Nova Locação", "Equipamentos Alugados", "Dashboard", "Patrimônio (Ativos)"],
     )
     st.sidebar.divider()
     rentals = load_rentals()
@@ -181,35 +246,25 @@ def render_new_rental() -> None:
     st.write("Registre a movimentação de um equipamento (próprio ou terceiro).")
 
     with st.form("new_rental_form", clear_on_submit=True):
+        st.subheader("1. Dados do Equipamento")
         col_one, col_two = st.columns(2)
         with col_one:
             equipamento = st.text_input(
-                "Equipamento",
-                placeholder="Ex.: Betoneira 400L, Martelete 15kg",
+                "Identificação do Equipamento",
+                placeholder="Ex.: Betoneira 01",
+                help="Se for próprio, digite igualzinho cadastrou na aba de Patrimônio."
             )
             
             origem_sel = st.selectbox(
                 "Origem do Equipamento / Fornecedor",
                 FORNECEDORES_PADRAO,
-                help="Selecione se é equipamento CM (próprio) ou locação de parceiro."
             )
             
             fornecedor_custom = ""
             if origem_sel == "Outro (especificar)":
                 fornecedor_custom = st.text_input("Digite o nome do fornecedor:")
-            
-            obra = st.selectbox(
-                "Obra de destino",
-                OBRAS
-            )
-            
-            custo_diario = st.number_input(
-                "Custo diário (R$)",
-                min_value=0.0,
-                step=5.0,
-                format="%.2f",
-                help="Para equipamentos próprios, você pode lançar o custo interno/depreciação ou R$ 0,00."
-            )
+                
+            obra = st.selectbox("Obra de destino", OBRAS)
             
         with col_two:
             data_retirada = st.date_input(
@@ -222,20 +277,34 @@ def render_new_rental() -> None:
                 value=date.today() + timedelta(days=7),
                 format="DD/MM/YYYY",
             )
-            st.info(
-                "📌 **Classificação:**\n"
-                "- **Equipamento CM:** Equipamento Próprio.\n"
-                "- **HL Locações, Loc Express, Escan:** Locação Terceirizada."
+
+        st.subheader("2. Regimes e Valores de Locação")
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            custo_diario = st.number_input(
+                "Custo Diário (R$)",
+                min_value=0.0, step=5.0, format="%.2f"
+            )
+        with col_c2:
+            custo_mensal = st.number_input(
+                "Custo Mensal (R$)",
+                min_value=0.0, step=50.0, format="%.2f",
+                help="Deixe R$ 0,00 se for cobrar apenas por diária pura."
+            )
+        with col_c3:
+            limite_dias = st.number_input(
+                "Dias p/ virar mês cheio",
+                min_value=1, max_value=30, value=15,
+                help="Ex: Se passar de 15 dias quebrados, cobra o valor do mês cheio."
             )
 
         submitted = st.form_submit_button(
-            "Registrar locação",
+            "Registrar Movimentação",
             type="primary",
             use_container_width=True,
         )
 
     if submitted:
-        # Define fornecedor final e tipo
         if origem_sel == "Outro (especificar)":
             fornecedor_final = fornecedor_custom.strip() if fornecedor_custom.strip() else "Outro"
             tipo_origem = "Terceiros"
@@ -247,7 +316,7 @@ def render_new_rental() -> None:
             tipo_origem = "Terceiros"
 
         if not equipamento.strip():
-            st.error("Informe o nome do equipamento.")
+            st.error("Informe o nome/identificação do equipamento.")
         elif data_devolucao < data_retirada:
             st.error("A data de devolução deve ser igual ou posterior à retirada.")
         else:
@@ -259,8 +328,10 @@ def render_new_rental() -> None:
                 data_retirada=data_retirada,
                 data_devolucao=data_devolucao,
                 custo_diario=custo_diario,
+                custo_mensal=custo_mensal,
+                limite_dias=int(limite_dias)
             )
-            st.success(f"Equipamento '{equipamento}' ({tipo_origem}) registrado com sucesso!")
+            st.success(f"Equipamento '{equipamento}' registrado com sucesso!")
             st.rerun()
 
 
@@ -285,6 +356,9 @@ def render_active_rentals() -> None:
     metric_three.metric("Terceirizados", int((active["tipo_origem"] == "Terceiros").sum()))
     metric_four.metric("Em atraso", overdue_count)
 
+    # Aplica o calculo misto de custo em tempo real para ativos
+    active["Custo Acumulado (R$)"] = active.apply(total_cost, axis=1).map(format_currency)
+
     table = active[
         [
             "id",
@@ -294,23 +368,16 @@ def render_active_rentals() -> None:
             "obra",
             "data_retirada",
             "data_devolucao",
-            "custo_diario",
+            "Custo Acumulado (R$)",
         ]
     ].copy()
     table.columns = [
-        "ID",
-        "Equipamento",
-        "Origem",
-        "Fornecedor",
-        "Obra",
-        "Retirada",
-        "Devolução",
-        "Custo diário",
+        "ID", "Equipamento", "Origem", "Fornecedor", "Obra", "Retirada", "Devolução", "Custo Acumulado"
     ]
     table["Retirada"] = table["Retirada"].map(format_date)
     table["Devolução"] = table["Devolução"].map(format_date)
-    table["Custo diário"] = table["Custo diário"].map(format_currency)
     table["Prazo"] = active.apply(deadline_label, axis=1).values
+    
     st.dataframe(table, hide_index=True, use_container_width=True)
 
     st.subheader("Dar baixa em devolução")
@@ -339,14 +406,11 @@ def render_dashboard() -> None:
 
     rentals["dias_cobrados"] = rentals.apply(rental_days, axis=1)
     rentals["custo_total"] = rentals.apply(total_cost, axis=1)
-    active = rentals[rentals["status"] == "Ativa"]
 
     total_cost_value = float(rentals["custo_total"].sum())
-    daily_cost_active = float(active["custo_diario"].sum()) if not active.empty else 0.0
 
     col1, col2 = st.columns(2)
-    col1.metric("Custo Total Acumulado", format_currency(total_cost_value))
-    col2.metric("Custo Diário Ativo (Dia)", format_currency(daily_cost_active))
+    col1.metric("Custo Total Acumulado (Próprios + Terceiros)", format_currency(total_cost_value))
 
     st.divider()
     col_g1, col_g2 = st.columns(2)
@@ -378,6 +442,72 @@ def render_dashboard() -> None:
     st.dataframe(resumo_df, hide_index=True, use_container_width=True)
 
 
+def render_patrimonio() -> None:
+    st.title("Patrimônio (Equipamentos CM)")
+    st.write("Cadastre os equipamentos próprios da empresa para calcular o seu valor de patrimônio e o retorno de investimento (ROI) gerado pelas locações.")
+
+    with st.form("new_asset_form", clear_on_submit=True):
+        st.subheader("Cadastrar Novo Ativo")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            nome_eq = st.text_input("Identificação do Equipamento", placeholder="Ex: Betoneira 400L - 01")
+        with c2:
+            valor_eq = st.number_input("Valor de Aquisição (R$)", min_value=0.0, step=100.0)
+        with c3:
+            data_aq = st.date_input("Data de Aquisição", format="DD/MM/YYYY")
+            
+        sub = st.form_submit_button("Cadastrar ao Patrimônio", type="primary")
+        if sub:
+            if nome_eq.strip():
+                if create_patrimonio(nome_eq, valor_eq, data_aq):
+                    st.success("Equipamento adicionado ao patrimônio!")
+                    st.rerun()
+                else:
+                    st.error("Já existe um equipamento com essa identificação exata.")
+            else:
+                st.error("Preencha a identificação do equipamento.")
+
+    st.divider()
+    
+    patrimonio_df = load_patrimonio()
+    if patrimonio_df.empty:
+        st.info("Nenhum equipamento próprio cadastrado no patrimônio ainda.")
+        return
+
+    # Painel de Patrimônio
+    total_patrimonio = patrimonio_df["valor_aquisicao"].sum()
+    st.metric("💰 Valor Total do Patrimônio (Ativos)", format_currency(total_patrimonio))
+
+    # Calculando os ganhos/economia de cada equipamento
+    locacoes_df = load_rentals()
+    locacoes_df["custo_total"] = locacoes_df.apply(total_cost, axis=1)
+    
+    # Filtra só os próprios e soma pelo nome exato do equipamento
+    ganhos = locacoes_df[locacoes_df["tipo_origem"] == "Próprio (CM)"].groupby("equipamento")["custo_total"].sum().reset_index()
+    ganhos.rename(columns={"custo_total": "retorno_gerado"}, inplace=True)
+
+    # Junta a tabela de patrimônio com os ganhos
+    merged = pd.merge(patrimonio_df, ganhos, on="equipamento", how="left")
+    merged["retorno_gerado"] = merged["retorno_gerado"].fillna(0)
+    
+    # Impede divisão por zero no ROI
+    merged["roi_perc"] = merged.apply(
+        lambda row: (row["retorno_gerado"] / row["valor_aquisicao"] * 100) if row["valor_aquisicao"] > 0 else 0, 
+        axis=1
+    )
+
+    st.subheader("Relação de Ativos e Retorno")
+    display_df = merged[["equipamento", "data_aquisicao", "valor_aquisicao", "retorno_gerado", "roi_perc"]].copy()
+    display_df.columns = ["Equipamento", "Data Aquisição", "Valor Investido", "Retorno (Locações)", "ROI (%)"]
+    
+    display_df["Data Aquisição"] = display_df["Data Aquisição"].map(format_date)
+    display_df["Valor Investido"] = display_df["Valor Investido"].map(format_currency)
+    display_df["Retorno (Locações)"] = display_df["Retorno (Locações)"].map(format_currency)
+    display_df["ROI (%)"] = display_df["ROI (%)"].apply(lambda x: f"{x:,.2f}%".replace('.',','))
+
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="CM Rental | Controle de locações",
@@ -392,6 +522,8 @@ def main() -> None:
         render_new_rental()
     elif menu == "Equipamentos Alugados":
         render_active_rentals()
+    elif menu == "Patrimônio (Ativos)":
+        render_patrimonio()
     else:
         render_dashboard()
 
