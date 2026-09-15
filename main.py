@@ -9,7 +9,7 @@ import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "locacoes.db"
-LOGO_PATH = APP_DIR / "cm-rental-logo.png"
+LOGO_PATH = APP_DIR / "IMG_0207.png"
 ATTACHED_LOGO_PATH = APP_DIR / "attached_assets" / "IMG_0207_1789499383772.png"
 
 
