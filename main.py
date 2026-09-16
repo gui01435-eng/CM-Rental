@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sqlite3
 import urllib.parse
+import io
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -148,7 +149,6 @@ def load_patrimonio() -> pd.DataFrame:
 
 
 def update_patrimonio_completo(old_name: str, new_name: str, origem: str, val_compra: float, val_diaria: float, val_mensal: float, dt_aq: str) -> None:
-    """Atualiza o equipamento e cascateia o novo nome para o histórico se for alterado."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -166,7 +166,6 @@ def update_patrimonio_completo(old_name: str, new_name: str, origem: str, val_co
 
 
 def delete_patrimonio(nome_eq: str) -> None:
-    """Exclui o equipamento do estoque/patrimônio."""
     with get_connection() as conn:
         conn.execute("DELETE FROM patrimonio WHERE equipamento = ?", (nome_eq,))
         conn.commit()
@@ -219,39 +218,7 @@ def concluir_manutencao_mes(cronograma_id: int, data_conclusao: date, custo: flo
             connection.commit()
 
 
-def ensure_patrimonio_exists(equipamento: str, data_retirada: str) -> None:
-    with get_connection() as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO patrimonio (equipamento, valor_aquisicao, data_aquisicao, status_ativo, intervalo_manutencao_dias, ultima_revisao)
-            VALUES (?, 0, ?, 'Operacional', 30, ?)
-            """,
-            (equipamento.strip(), data_retirada, data_retirada),
-        )
-        connection.commit()
-
-
-def update_patrimonio_dados(equipamento: str, valor: float, data_aquisicao: str, intervalo_dias: int) -> None:
-    with get_connection() as connection:
-        connection.execute(
-            """
-            UPDATE patrimonio 
-            SET valor_aquisicao = ?, data_aquisicao = ?, intervalo_manutencao_dias = ?
-            WHERE equipamento = ?
-            """,
-            (valor, data_aquisicao, intervalo_dias, equipamento),
-        )
-        connection.commit()
-
-
-def registrar_evento_manutencao(
-    equipamento: str,
-    tipo_evento: str,
-    data_evento: date,
-    custo: float,
-    motivo: str,
-    prestador: str,
-) -> None:
+def registrar_evento_manutencao(equipamento: str, tipo_evento: str, data_evento: date, custo: float, motivo: str, prestador: str) -> None:
     with get_connection() as connection:
         connection.execute(
             """
@@ -261,20 +228,11 @@ def registrar_evento_manutencao(
             (equipamento.strip(), tipo_evento, data_evento.isoformat(), custo, motivo.strip(), prestador.strip()),
         )
         if tipo_evento == "Perda Total / Baixa":
-            connection.execute(
-                "UPDATE patrimonio SET status_ativo = 'Baixado / Perda' WHERE equipamento = ?",
-                (equipamento.strip(),)
-            )
+            connection.execute("UPDATE patrimonio SET status_ativo = 'Baixado / Perda' WHERE equipamento = ?", (equipamento.strip(),))
         elif tipo_evento == "Conserto (Corretiva)":
-            connection.execute(
-                "UPDATE patrimonio SET status_ativo = 'Em Oficina' WHERE equipamento = ?",
-                (equipamento.strip(),)
-            )
+            connection.execute("UPDATE patrimonio SET status_ativo = 'Em Oficina' WHERE equipamento = ?", (equipamento.strip(),))
         elif tipo_evento == "Preventiva Concluída":
-            connection.execute(
-                "UPDATE patrimonio SET status_ativo = 'Operacional', ultima_revisao = ? WHERE equipamento = ?",
-                (data_evento.isoformat(), equipamento.strip())
-            )
+            connection.execute("UPDATE patrimonio SET status_ativo = 'Operacional', ultima_revisao = ? WHERE equipamento = ?", (data_evento.isoformat(), equipamento.strip()))
         connection.commit()
 
 
@@ -287,17 +245,7 @@ def liberar_maquina_oficina(equipamento: str, data_liberacao: date) -> None:
         connection.commit()
 
 
-def create_rental(
-    equipamento: str,
-    fornecedor: str,
-    tipo_origem: str,
-    obra: str,
-    data_retirada: date,
-    data_devolucao: date,
-    custo_diario: float,
-    custo_mensal: float,
-    limite_dias: int,
-) -> None:
+def create_rental(equipamento: str, fornecedor: str, tipo_origem: str, obra: str, data_retirada: date, data_devolucao: date, custo_diario: float, custo_mensal: float, limite_dias: int) -> None:
     with get_connection() as connection:
         connection.execute(
             """
@@ -305,17 +253,7 @@ def create_rental(
                 (equipamento, fornecedor, tipo_origem, obra, data_retirada, data_devolucao, custo_diario, custo_mensal, limite_dias)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                equipamento.strip(),
-                fornecedor.strip(),
-                tipo_origem,
-                obra.strip(),
-                data_retirada.isoformat(),
-                data_devolucao.isoformat(),
-                custo_diario,
-                custo_mensal,
-                limite_dias,
-            ),
+            (equipamento.strip(), fornecedor.strip(), tipo_origem, obra.strip(), data_retirada.isoformat(), data_devolucao.isoformat(), custo_diario, custo_mensal, limite_dias),
         )
         connection.commit()
 
@@ -323,11 +261,7 @@ def create_rental(
 def close_rental(rental_id: int) -> None:
     with get_connection() as connection:
         connection.execute(
-            """
-            UPDATE locacoes
-            SET status = 'Devolvida', data_baixa = ?
-            WHERE id = ? AND status = 'Ativa'
-            """,
+            "UPDATE locacoes SET status = 'Devolvida', data_baixa = ? WHERE id = ? AND status = 'Ativa'",
             (date.today().isoformat(), rental_id),
         )
         connection.commit()
@@ -360,7 +294,6 @@ def total_cost(row: pd.Series) -> float:
             meses_cheios += 1
             dias_sobra = 0
         return (meses_cheios * mensal) + (dias_sobra * diario)
-    
     return days * diario
 
 
@@ -406,14 +339,76 @@ def gerar_link_google_agenda(equipamento: str, ano: int, mes: int, obs: str) -> 
             data_evento = date(ano, mes, 5)
         except ValueError:
             data_evento = hoje
-
     d1 = data_evento.strftime("%Y%m%d")
     d2 = (data_evento + timedelta(days=1)).strftime("%Y%m%d")
-    
     titulo = f"🔧 Manutenção CM: {equipamento}"
     detalhes = f"Manutenção Preventiva programada para o mês {mes:02d}/{ano}.\n\nObs/Tarefas: {obs}\n\nAcesse o sistema CM Rental após realizar para dar baixa."
-    
     return f"https://calendar.google.com/calendar/render?action=TEMPLATE&text={urllib.parse.quote(titulo)}&dates={d1}/{d2}&details={urllib.parse.quote(detalhes)}"
+
+
+# ==== SISTEMA DE EXPORTAÇÃO EXCEL/PDF ====
+def export_buttons(df: pd.DataFrame, filename_prefix: str, titulo_pdf: str) -> None:
+    st.write("") 
+    c1, c2, c3 = st.columns([1.5, 1.5, 3])
+    
+    # Gerar Excel
+    try:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Relatorio')
+        excel_data = output.getvalue()
+        
+        c1.download_button(
+            label="📊 Baixar Excel",
+            data=excel_data,
+            file_name=f"{filename_prefix}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    except Exception as e:
+        c1.error("Excel indisponível (atualize requirements.txt)")
+    
+    # Gerar PDF
+    try:
+        from fpdf import FPDF
+        pdf = FPDF(orientation='L', unit='mm', format='A4')
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 14)
+        safe_titulo = titulo_pdf.encode('latin-1', 'replace').decode('latin-1')
+        pdf.cell(0, 10, safe_titulo, ln=True, align='C')
+        pdf.ln(5)
+        
+        pdf.set_font("Arial", 'B', 9)
+        printable_width = 277
+        num_cols = len(df.columns)
+        base_width = printable_width / num_cols if num_cols > 0 else printable_width
+        row_height = 7
+        
+        # Cabeçalho
+        for col in df.columns:
+            safe_col = str(col).encode('latin-1', 'replace').decode('latin-1')[:30]
+            pdf.cell(base_width, row_height, safe_col, border=1, align='C')
+        pdf.ln(row_height)
+        
+        # Linhas
+        pdf.set_font("Arial", '', 8)
+        for _, row in df.iterrows():
+            for item in row:
+                safe_item = str(item).encode('latin-1', 'replace').decode('latin-1')[:35]
+                pdf.cell(base_width, row_height, safe_item, border=1)
+            pdf.ln(row_height)
+            
+        pdf_data = pdf.output(dest='S').encode('latin-1')
+        
+        c2.download_button(
+            label="📄 Baixar PDF",
+            data=pdf_data,
+            file_name=f"{filename_prefix}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+    except ImportError:
+        c2.error("PDF indisponível (atualize requirements.txt)")
 
 
 def render_sidebar() -> str:
@@ -440,11 +435,9 @@ def render_sidebar() -> str:
     rentals = load_rentals()
     active_count = int((rentals["status"] == "Ativa").sum()) if not rentals.empty else 0
     st.sidebar.metric("Locações ativas", active_count)
-    
     st.sidebar.divider()
     st.sidebar.markdown("👤 **Guilherme Macedo de Araújo Matias da Costa**")
     st.sidebar.caption("Diretoria CM Rental")
-    
     return menu
 
 
@@ -461,7 +454,6 @@ def render_cadastro_equipamentos() -> None:
             fornecedor_custom = ""
             if origem_sel == "Outro (especificar)":
                 fornecedor_custom = st.text_input("Nome do parceiro/fornecedor:")
-            
         with c2:
             val_compra = st.number_input("Valor de Compra (R$) - Preencha apenas se for CM", min_value=0.0, step=100.0, format="%.2f")
             val_diaria = st.number_input("Valor Padrão da Diária (R$)", min_value=0.0, step=5.0, format="%.2f")
@@ -497,6 +489,10 @@ def render_cadastro_equipamentos() -> None:
     if not df_eq.empty:
         show_df = df_eq[["equipamento", "origem_equipamento", "status_ativo", "diaria_padrao", "mensal_padrao", "valor_aquisicao"]].copy()
         show_df.columns = ["Equipamento", "Origem/Dono", "Status", "Diária (R$)", "Mensal (R$)", "Custo Aquisição (R$)"]
+        
+        # Botões de Exportação
+        export_buttons(show_df, "estoque_cm_rental", "Relatório de Estoque e Patrimônio - CM Rental")
+        
         show_df["Diária (R$)"] = show_df["Diária (R$)"].map(format_currency)
         show_df["Mensal (R$)"] = show_df["Mensal (R$)"].map(format_currency)
         show_df["Custo Aquisição (R$)"] = show_df["Custo Aquisição (R$)"].map(format_currency)
@@ -609,9 +605,7 @@ def render_active_rentals() -> None:
         st.info("Nenhum equipamento em campo no momento.")
         return
 
-    # Calcula os custos em número para as somas
     active["custo_numero"] = active.apply(total_cost, axis=1)
-    
     overdue_count = sum(as_date(row["data_devolucao"]) < date.today() for _, row in active.iterrows())
     
     m1, m2, m3, m4 = st.columns(4)
@@ -620,18 +614,19 @@ def render_active_rentals() -> None:
     m3.metric("Terceiros", int((active["tipo_origem"] == "Terceiros").sum()))
     m4.metric("Devoluções em Atraso", overdue_count)
 
+    # Preparar DataFrame consolidado para exportação
+    df_export = active[["equipamento", "origem", "fornecedor", "obra", "data_retirada", "data_devolucao", "custo_numero"]].copy() if "origem" in active.columns else active[["equipamento", "tipo_origem", "fornecedor", "obra", "data_retirada", "data_devolucao", "custo_numero"]].copy()
+    df_export.columns = ["Equipamento", "Origem", "Fornecedor", "Obra", "Retirada", "Devolucao", "Custo Acumulado (R$)"]
+    export_buttons(df_export, "equipamentos_em_obra", "Relatório de Equipamentos em Obra")
+
     st.divider()
 
     obras_ativas = active["obra"].unique()
-    
     for obra in obras_ativas:
         df_obra = active[active["obra"] == obra].copy()
         total_obra = df_obra["custo_numero"].sum()
         
-        # Cria um quadro para cada obra
         with st.expander(f"🏗️ Obra: {obra} | Custo Acumulado Atual: {format_currency(total_obra)}", expanded=True):
-            
-            # Prepara a tabela de exibição da obra
             df_show = df_obra[["id", "equipamento", "tipo_origem", "fornecedor", "data_retirada", "data_devolucao"]].copy()
             df_show["Custo"] = df_obra["custo_numero"].map(format_currency)
             df_show["Prazo"] = df_obra.apply(deadline_label, axis=1)
@@ -710,6 +705,8 @@ def render_plano_anual() -> None:
         matriz_dados.append(linha)
 
     df_matriz = pd.DataFrame(matriz_dados)
+    
+    export_buttons(df_matriz, f"plano_manutencao_{ano_sel}", f"Plano de Manutenção Preventiva - {ano_sel}")
     st.dataframe(df_matriz, hide_index=True, use_container_width=True)
 
     st.divider()
@@ -842,7 +839,7 @@ def render_manutencoes() -> None:
 
 def render_patrimonio_lucro() -> None:
     st.title("Patrimônio & Lucro Real por Máquina")
-    st.write("Visão financeira individual: quanto a máquina da CM custou, quanto faturou, quanto gastou e o lucro líquido real.")
+    st.write("Visão financeira individual: DRE da máquina.")
 
     patrimonio_df = load_patrimonio()
     pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
@@ -898,6 +895,9 @@ def render_patrimonio_lucro() -> None:
     tabela_show.columns = [
         "Equipamento", "Status", "Valor Compra", "Faturado", "Custos Conserto", "Lucro Operacional", "Saldo Final", "Desempenho"
     ]
+    
+    export_buttons(tabela_show, "dre_maquinas_cm", "DRE - Patrimonio e Lucro por Maquina CM")
+    
     tabela_show["Valor Compra"] = tabela_show["Valor Compra"].map(format_currency)
     tabela_show["Faturado"] = tabela_show["Faturado"].map(format_currency)
     tabela_show["Custos Conserto"] = tabela_show["Custos Conserto"].map(format_currency)
@@ -928,9 +928,12 @@ def render_resultado_mensal() -> None:
         aggfunc="sum",
         fill_value=0.0,
     )
+    
+    tabela_obra = gastos_obra_mes.copy()
+    export_buttons(tabela_obra.reset_index(), "gastos_mensais_obras", "Relatório Mensal de Gastos por Obra")
+    
     st.bar_chart(gastos_obra_mes)
 
-    tabela_obra = gastos_obra_mes.copy()
     for col in tabela_obra.columns:
         tabela_obra[col] = tabela_obra[col].map(format_currency)
     st.dataframe(tabela_obra, use_container_width=True)
