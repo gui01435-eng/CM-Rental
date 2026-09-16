@@ -64,7 +64,6 @@ def init_db() -> None:
         if "limite_dias" not in cols_loc:
             connection.execute("ALTER TABLE locacoes ADD COLUMN limite_dias INTEGER DEFAULT 15")
 
-        # Tabela unificada para Frota e Terceiros
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS patrimonio (
@@ -148,6 +147,31 @@ def load_patrimonio() -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM patrimonio ORDER BY equipamento ASC", connection)
 
 
+def update_patrimonio_completo(old_name: str, new_name: str, origem: str, val_compra: float, val_diaria: float, val_mensal: float, dt_aq: str) -> None:
+    """Atualiza o equipamento e cascateia o novo nome para o histórico se for alterado."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE patrimonio
+            SET equipamento = ?, origem_equipamento = ?, valor_aquisicao = ?, diaria_padrao = ?, mensal_padrao = ?, data_aquisicao = ?
+            WHERE equipamento = ?
+            """,
+            (new_name.strip(), origem, val_compra, val_diaria, val_mensal, dt_aq, old_name)
+        )
+        if old_name != new_name.strip():
+            conn.execute("UPDATE locacoes SET equipamento = ? WHERE equipamento = ?", (new_name.strip(), old_name))
+            conn.execute("UPDATE manutencoes SET equipamento = ? WHERE equipamento = ?", (new_name.strip(), old_name))
+            conn.execute("UPDATE cronograma_preventiva SET equipamento = ? WHERE equipamento = ?", (new_name.strip(), old_name))
+        conn.commit()
+
+
+def delete_patrimonio(nome_eq: str) -> None:
+    """Exclui o equipamento do estoque/patrimônio."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM patrimonio WHERE equipamento = ?", (nome_eq,))
+        conn.commit()
+
+
 def load_manutencoes() -> pd.DataFrame:
     with get_connection() as connection:
         return pd.read_sql_query("SELECT * FROM manutencoes ORDER BY date(data_evento) DESC, id DESC", connection)
@@ -193,6 +217,18 @@ def concluir_manutencao_mes(cronograma_id: int, data_conclusao: date, custo: flo
                 (data_conclusao.isoformat(), equipamento),
             )
             connection.commit()
+
+
+def ensure_patrimonio_exists(equipamento: str, data_retirada: str) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO patrimonio (equipamento, valor_aquisicao, data_aquisicao, status_ativo, intervalo_manutencao_dias, ultima_revisao)
+            VALUES (?, 0, ?, 'Operacional', 30, ?)
+            """,
+            (equipamento.strip(), data_retirada, data_retirada),
+        )
+        connection.commit()
 
 
 def update_patrimonio_dados(equipamento: str, valor: float, data_aquisicao: str, intervalo_dias: int) -> None:
@@ -414,7 +450,7 @@ def render_sidebar() -> str:
 
 def render_cadastro_equipamentos() -> None:
     st.title("Cadastro de Equipamentos (Estoque)")
-    st.write("Registre o maquinário próprio (CM) ou de locadoras parceiras para agilizar os despachos.")
+    st.write("Registre e gerencie o maquinário próprio (CM) ou de locadoras parceiras.")
 
     with st.form("form_cad_eq", clear_on_submit=True):
         st.subheader("Inserir Novo Equipamento")
@@ -457,6 +493,7 @@ def render_cadastro_equipamentos() -> None:
     st.divider()
     st.subheader("Lista de Equipamentos Cadastrados")
     df_eq = load_patrimonio()
+    
     if not df_eq.empty:
         show_df = df_eq[["equipamento", "origem_equipamento", "status_ativo", "diaria_padrao", "mensal_padrao", "valor_aquisicao"]].copy()
         show_df.columns = ["Equipamento", "Origem/Dono", "Status", "Diária (R$)", "Mensal (R$)", "Custo Aquisição (R$)"]
@@ -464,6 +501,38 @@ def render_cadastro_equipamentos() -> None:
         show_df["Mensal (R$)"] = show_df["Mensal (R$)"].map(format_currency)
         show_df["Custo Aquisição (R$)"] = show_df["Custo Aquisição (R$)"].map(format_currency)
         st.dataframe(show_df, hide_index=True, use_container_width=True)
+        
+        st.write("")
+        with st.expander("✏️ Editar ou Excluir Equipamento"):
+            st.info("Atenção: ao alterar o nome de um equipamento, ele será atualizado em todo o histórico de locações.")
+            eq_selecionado = st.selectbox("Selecione a máquina para alterar:", df_eq["equipamento"].tolist())
+            linha = df_eq[df_eq["equipamento"] == eq_selecionado].iloc[0]
+            
+            c_ed1, c_ed2 = st.columns(2)
+            with c_ed1:
+                novo_nome = st.text_input("Nome", value=linha["equipamento"])
+                nova_origem = st.selectbox(
+                    "Origem", 
+                    FORNECEDORES_PADRAO + [linha["origem_equipamento"]], 
+                    index=0 if linha["origem_equipamento"] not in FORNECEDORES_PADRAO else FORNECEDORES_PADRAO.index(linha["origem_equipamento"])
+                )
+                novo_val_compra = st.number_input("Valor de Compra", value=float(linha["valor_aquisicao"]), format="%.2f")
+            with c_ed2:
+                nova_diaria = st.number_input("Diária Pad.", value=float(linha.get("diaria_padrao", 0.0)), format="%.2f")
+                novo_mensal = st.number_input("Mensal Pad.", value=float(linha.get("mensal_padrao", 0.0)), format="%.2f")
+                nova_data = st.date_input("Data Aq.", value=as_date(linha["data_aquisicao"]), format="DD/MM/YYYY")
+
+            col_btn1, col_btn2 = st.columns([1, 1])
+            with col_btn1:
+                if st.button("Salvar Alterações", type="primary", use_container_width=True):
+                    update_patrimonio_completo(eq_selecionado, novo_nome, nova_origem, novo_val_compra, nova_diaria, novo_mensal, nova_data.isoformat())
+                    st.success("Equipamento atualizado com sucesso!")
+                    st.rerun()
+            with col_btn2:
+                if st.button("Excluir Equipamento", use_container_width=True):
+                    delete_patrimonio(eq_selecionado)
+                    st.success("Equipamento removido do estoque!")
+                    st.rerun()
     else:
         st.info("Nenhum equipamento registrado ainda.")
 
@@ -483,7 +552,6 @@ def render_new_rental() -> None:
         return
 
     st.subheader("1. Selecione o Equipamento")
-    # Colocando o seletor fora do form, o sistema consegue atualizar os valores padrão automaticamente!
     eq_selecionado = st.selectbox("Máquina Disponível no Estoque:", disponiveis["equipamento"].tolist())
     
     linha_eq = disponiveis[disponiveis["equipamento"] == eq_selecionado].iloc[0]
@@ -501,7 +569,6 @@ def render_new_rental() -> None:
             data_devolucao = st.date_input("Previsão de Devolução", value=date.today() + timedelta(days=7), format="DD/MM/YYYY")
         
         st.subheader("2. Regimes e Valores de Cobrança")
-        st.caption("Esses valores foram preenchidos automaticamente com base no cadastro, mas você pode ajustá-los se precisar.")
         c3, c4, c5 = st.columns(3)
         with c3:
             custo_diario = st.number_input("Diária (R$)", value=diaria_pad, step=5.0, format="%.2f")
@@ -534,7 +601,7 @@ def render_new_rental() -> None:
 
 def render_active_rentals() -> None:
     st.title("Equipamentos Alugados / Em Obra")
-    st.write("Acompanhe prazos de devolução, custos acumulados e desmobilizações.")
+    st.write("Acompanhe as máquinas alocadas separadas por obra e o valor que cada frente está consumindo/faturando.")
 
     rentals = load_rentals()
     active = rentals[rentals["status"] == "Ativa"].copy()
@@ -542,48 +609,49 @@ def render_active_rentals() -> None:
         st.info("Nenhum equipamento em campo no momento.")
         return
 
-    overdue_count = sum(
-        as_date(row["data_devolucao"]) < date.today()
-        for _, row in active.iterrows()
-    )
+    # Calcula os custos em número para as somas
+    active["custo_numero"] = active.apply(total_cost, axis=1)
+    
+    overdue_count = sum(as_date(row["data_devolucao"]) < date.today() for _, row in active.iterrows())
     
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total em Uso", len(active))
+    m1.metric("Total de Máquinas em Uso", len(active))
     m2.metric("Próprios CM", int((active["tipo_origem"] == "Próprio (CM)").sum()))
     m3.metric("Terceiros", int((active["tipo_origem"] == "Terceiros").sum()))
     m4.metric("Devoluções em Atraso", overdue_count)
 
-    active["Custo Acumulado (R$)"] = active.apply(total_cost, axis=1).map(format_currency)
+    st.divider()
 
-    table = active[
-        [
-            "id",
-            "equipamento",
-            "tipo_origem",
-            "fornecedor",
-            "obra",
-            "data_retirada",
-            "data_devolucao",
-            "Custo Acumulado (R$)",
-        ]
-    ].copy()
-    table.columns = [
-        "ID", "Equipamento", "Origem", "Fornecedor", "Obra", "Retirada", "Devolução", "Custo Acumulado"
-    ]
-    table["Retirada"] = table["Retirada"].map(format_date)
-    table["Devolução"] = table["Devolução"].map(format_date)
-    table["Prazo"] = active.apply(deadline_label, axis=1).values
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    obras_ativas = active["obra"].unique()
+    
+    for obra in obras_ativas:
+        df_obra = active[active["obra"] == obra].copy()
+        total_obra = df_obra["custo_numero"].sum()
+        
+        # Cria um quadro para cada obra
+        with st.expander(f"🏗️ Obra: {obra} | Custo Acumulado Atual: {format_currency(total_obra)}", expanded=True):
+            
+            # Prepara a tabela de exibição da obra
+            df_show = df_obra[["id", "equipamento", "tipo_origem", "fornecedor", "data_retirada", "data_devolucao"]].copy()
+            df_show["Custo"] = df_obra["custo_numero"].map(format_currency)
+            df_show["Prazo"] = df_obra.apply(deadline_label, axis=1)
+            
+            df_show.columns = ["ID", "Equipamento", "Origem", "Fornecedor", "Retirada", "Devolução", "Custo", "Prazo"]
+            df_show["Retirada"] = df_show["Retirada"].map(format_date)
+            df_show["Devolução"] = df_show["Devolução"].map(format_date)
+            
+            st.dataframe(df_show, hide_index=True, use_container_width=True)
 
+    st.divider()
     st.subheader("Dar Baixa em Devolução")
     rental_options = {
         f'#{row["id"]} · {row["equipamento"]} ({row["fornecedor"]}) · {row["obra"]}': int(row["id"])
         for _, row in active.iterrows()
     }
-    selected_label = st.selectbox("Selecione a locação encerrada", list(rental_options.keys()))
+    selected_label = st.selectbox("Selecione a locação encerrada para desmobilizar:", list(rental_options.keys()))
     if st.button("Confirmar Devolução", type="primary"):
         close_rental(rental_options[selected_label])
-        st.success("Equipamento marcado como devolvido!")
+        st.success("Equipamento desmobilizado com sucesso!")
         st.rerun()
 
 
@@ -592,7 +660,6 @@ def render_plano_anual() -> None:
     st.write("Visão em planilha anual do plano de revisões periódicas da frota própria CM.")
 
     patrimonio_df = load_patrimonio()
-    # Filtra apenas os que são da própria CM para o plano de manutenção
     pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
     
     if pat_cm.empty:
@@ -780,28 +847,9 @@ def render_patrimonio_lucro() -> None:
     patrimonio_df = load_patrimonio()
     pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
 
-    if not pat_cm.empty:
-        with st.expander("✏️ Ajustar Valor de Compra & Ciclo de Manutenção"):
-            col1, col2, col3 = st.columns([2, 1, 1])
-            with col1:
-                eq_sel = st.selectbox("Selecione o equipamento:", pat_cm["equipamento"].tolist())
-            linha = pat_cm[pat_cm["equipamento"] == eq_sel].iloc[0]
-            with col2:
-                v_compra = st.number_input("Valor de Compra (R$)", value=float(linha["valor_aquisicao"]), step=100.0, format="%.2f")
-            with col3:
-                interv = st.number_input("Periodicidade Revisão (Dias)", value=int(linha.get("intervalo_manutencao_dias", 30)), step=5)
-            dt_aq = st.date_input("Data de Aquisição", value=as_date(linha["data_aquisicao"]), format="DD/MM/YYYY")
-
-            if st.button("Salvar Ajustes", type="primary"):
-                update_patrimonio_dados(eq_sel, v_compra, dt_aq.isoformat(), int(interv))
-                st.success("Dados atualizados com sucesso!")
-                st.rerun()
-
     if pat_cm.empty:
         st.info("Nenhum equipamento próprio CM registrado no estoque ainda.")
         return
-
-    st.divider()
 
     locacoes_df = load_rentals()
     locacoes_df["custo_total"] = locacoes_df.apply(total_cost, axis=1)
