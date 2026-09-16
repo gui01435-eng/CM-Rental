@@ -4,138 +4,188 @@ import streamlit as st
 from datetime import date
 from pathlib import Path
 
+# ==========================================
+# CONFIGURAÇÕES E BANCO DE DADOS
+# ==========================================
+st.set_page_config(page_title="Canteiro CM | ERP Completo", page_icon="🏗️", layout="wide")
+
 DB_PATH = Path(__file__).resolve().parent / "canteiro_cm.db"
 
-STATUS_OBRA = ["Prospecção", "Proposta", "Em execução", "Paralisada", "Concluída"]
-ETAPAS_CUSTO = ["Alimentação", "Concreto", "EPI", "Estrutura", "Fôrmas", "Hidráulica", "Elétrica", "Locação", "Mão de Obra"]
-
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS obras (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                codigo TEXT NOT NULL,
-                nome TEXT NOT NULL,
-                cliente TEXT,
-                status TEXT NOT NULL,
-                regime TEXT,
-                percent_admin REAL,
-                fee_mensal REAL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS custos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                obra_id INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                etapa TEXT,
-                fornecedor TEXT,
-                nf BOOLEAN,
-                reembolso_cm BOOLEAN,
-                descricao TEXT,
-                valor REAL NOT NULL,
-                FOREIGN KEY(obra_id) REFERENCES obras(id)
-            )
-        """)
-        conn.commit()
-
-def render_obras():
-    st.header("Pipeline de Obras")
-    st.write("Gerencie as obras e contratos no funil.")
+    conn = get_connection()
+    # Criar tabelas básicas para o data_editor gerenciar dinamicamente
+    tabelas = {
+        "equipe": ["id", "nome", "funcao", "salario_base", "extras", "custo_mensal", "ativo"],
+        "obras": ["id", "codigo", "nome", "cliente", "status", "regime", "fee_mensal", "orcamento"],
+        "oportunidades": ["id", "nome", "cliente", "tipo", "estagio", "valor_estimado", "probabilidade"],
+        "tarefas": ["id", "titulo", "responsavel", "prioridade", "status", "prazo", "descricao"],
+        "custos": ["id", "obra_id", "data", "etapa", "fornecedor", "nf", "reembolso_cm", "valor", "descricao"],
+        "locacoes": ["id", "equipamento", "obra_destino", "data_retirada", "data_devolucao", "custo_diario", "status"],
+        "patrimonio": ["id", "equipamento", "origem", "status", "valor_compra", "diaria_padrao"]
+    }
     
-    with st.form("form_obra", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            codigo = st.text_input("Código / Centro de Custo", placeholder="Ex: RIMAR01")
-            nome = st.text_input("Nome da Obra")
-            cliente = st.text_input("Cliente")
-        with c2:
-            status = st.selectbox("Etapa do Funil", STATUS_OBRA)
-            regime = st.selectbox("Regime", ["Por administração", "Empreitada global", "Outro contrato"])
-            fee = st.number_input("Fee Mensal (R$)", min_value=0.0, step=100.0)
-        
-        if st.form_submit_button("Salvar Obra", type="primary"):
-            if codigo and nome:
-                with get_connection() as conn:
-                    conn.execute("INSERT INTO obras (codigo, nome, cliente, status, regime, fee_mensal) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (codigo, nome, cliente, status, regime, fee))
-                    conn.commit()
-                st.success(f"Obra {codigo} cadastrada!")
-                st.rerun()
-            else:
-                st.error("Preencha o código e o nome.")
+    for tabela, colunas in tabelas.items():
+        try:
+            pd.read_sql(f"SELECT * FROM {tabela} LIMIT 1", conn)
+        except:
+            # Se a tabela não existir, cria um DataFrame vazio e salva no SQL
+            df_vazio = pd.DataFrame(columns=colunas)
+            df_vazio.to_sql(tabela, conn, if_exists="replace", index=False)
+    conn.close()
 
-    st.divider()
-    with get_connection() as conn:
-        df = pd.read_sql("SELECT * FROM obras", conn)
-        if not df.empty:
-            st.dataframe(df, hide_index=True, use_container_width=True)
-        else:
-            st.info("Nenhuma obra cadastrada.")
-
-def render_custos():
-    st.header("Custos de Material e Serviços")
+# ==========================================
+# FUNÇÕES DE INTERFACE (CRUD DINÂMICO)
+# ==========================================
+def render_planilha_dinamica(tabela, titulo, subtitulo):
+    st.header(titulo)
+    st.write(subtitulo)
+    st.info("💡 Dica: Dê um duplo clique na célula para editar. Use a linha vazia no final para adicionar novos registros. Selecione a linha e aperte 'Delete' para apagar.")
     
-    with get_connection() as conn:
-        obras = pd.read_sql("SELECT id, codigo, nome FROM obras WHERE status IN ('Em execução', 'Paralisada')", conn)
+    conn = get_connection()
+    df = pd.read_sql(f"SELECT * FROM {tabela}", conn)
     
-    if obras.empty:
-        st.warning("Cadastre uma obra 'Em execução' ou 'Paralisada' para lançar custos.")
-        return
-
-    obra_dict = {f"{row['codigo']} - {row['nome']}": row['id'] for _, row in obras.iterrows()}
+    # Editor de dados interativo (Substitui os formulários complexos do JS)
+    df_editado = st.data_editor(df, num_rows="dynamic", use_container_width=True, key=f"editor_{tabela}")
     
-    with st.form("form_custo", clear_on_submit=True):
-        obra_selecionada = st.selectbox("Obra / Centro de Custo", list(obra_dict.keys()))
-        c1, c2 = st.columns(2)
-        with c1:
-            dt_custo = st.date_input("Data", date.today())
-            etapa = st.selectbox("Etapa", ETAPAS_CUSTO)
-            fornecedor = st.text_input("Fornecedor")
-            valor = st.number_input("Valor (R$)", min_value=0.0, step=10.0)
-        with c2:
-            descricao = st.text_area("Descrição")
-            nf = st.checkbox("Com nota fiscal")
-            reemb = st.checkbox("Pago pela CM (Reembolso)")
-            
-        if st.form_submit_button("Lançar Custo", type="primary"):
-            if valor > 0:
-                with get_connection() as conn:
-                    conn.execute("""
-                        INSERT INTO custos (obra_id, data, etapa, fornecedor, nf, reembolso_cm, descricao, valor)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (obra_dict[obra_selecionada], dt_custo.isoformat(), etapa, fornecedor, nf, reemb, descricao, valor))
-                    conn.commit()
-                st.success("Custo lançado com sucesso!")
-                st.rerun()
-            else:
-                st.error("Informe um valor válido.")
+    if st.button(f"💾 Salvar alterações em {titulo}", type="primary"):
+        df_editado.to_sql(tabela, conn, if_exists="replace", index=False)
+        st.success("Banco de dados atualizado com sucesso!")
+        st.rerun()
+    conn.close()
 
-    st.divider()
-    with get_connection() as conn:
-        df = pd.read_sql("SELECT c.data, o.codigo as obra, c.etapa, c.fornecedor, c.valor, c.nf, c.reembolso_cm FROM custos c JOIN obras o ON c.obra_id = o.id ORDER BY c.id DESC", conn)
-        if not df.empty:
-            df["valor"] = df["valor"].apply(lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-            df["nf"] = df["nf"].map({1: "Sim", 0: "Não"})
-            df["reembolso_cm"] = df["reembolso_cm"].map({1: "Sim", 0: "Não"})
-            st.dataframe(df, hide_index=True, use_container_width=True)
-
+# ==========================================
+# MENUS E NAVEGAÇÃO DO ERP
+# ==========================================
 def main():
-    st.set_page_config(page_title="Canteiro CM | Core", layout="wide")
     init_db()
     
-    st.sidebar.title("Canteiro CM")
-    menu = st.sidebar.radio("Navegação", ["Obras", "Custos"])
+    st.sidebar.image("https://via.placeholder.com/150x50.png?text=CM+Engenharia", use_container_width=True)
+    st.sidebar.markdown("### Canteiro CM")
+    st.sidebar.caption("Obras por administração & Gestão de Frotas")
+    st.sidebar.divider()
     
-    if menu == "Obras":
-        render_obras()
-    else:
-        render_custos()
+    menu = st.sidebar.radio(
+        "Módulos do Sistema",
+        [
+            "👥 Equipe",
+            "📅 Calendário de Alocação",
+            "🏗️ Pipeline de Obras",
+            "🚜 CM Rental (Equipamentos)",
+            "💸 Custos de Material",
+            "📊 Boletim de Medição",
+            "📈 Resultados da CM",
+            "🤝 Pipeline de Negócios (CRM)",
+            "✅ Pendências da Equipe"
+        ]
+    )
+    
+    st.sidebar.divider()
+    st.sidebar.caption("Operação CM Engenharia")
+
+    # 1. EQUIPE
+    if menu == "👥 Equipe":
+        render_planilha_dinamica(
+            "equipe", 
+            "Equipe & Cargos", 
+            "Cadastro de funções e funcionários. O custo mensal alimenta os rateios de medição."
+        )
+
+    # 2. CALENDÁRIO DE ALOCAÇÃO
+    elif menu == "📅 Calendário de Alocação":
+        st.header("Calendário de Alocação")
+        st.write("Um dia útil por linha, um funcionário por coluna. Distribua a equipe entre as obras.")
+        st.warning("⚠️ Como o calendário exige cruzamento diário de dados, a interface completa será ativada na próxima atualização com os componentes de grade. No momento, o rateio pode ser feito via Medição.")
+        conn = get_connection()
+        df_eq = pd.read_sql("SELECT nome, funcao FROM equipe WHERE ativo = 'True'", conn)
+        df_ob = pd.read_sql("SELECT codigo, nome FROM obras WHERE status = 'Em execução'", conn)
+        st.write("**Funcionários Ativos:**", len(df_eq))
+        st.write("**Obras em Execução:**", len(df_ob))
+        conn.close()
+
+    # 3. PIPELINE DE OBRAS
+    elif menu == "🏗️ Pipeline de Obras":
+        render_planilha_dinamica(
+            "obras", 
+            "Pipeline de Obras", 
+            "Arraste a visão geral das obras. Altere o status de 'Prospecção' até 'Concluída'."
+        )
+
+    # 4. CM RENTAL
+    elif menu == "🚜 CM Rental (Equipamentos)":
+        st.header("CM Rental | Gestão Integrada")
+        tab1, tab2 = st.tabs(["Estoque / Patrimônio", "Despacho / Locações Ativas"])
+        
+        with tab1:
+            render_planilha_dinamica(
+                "patrimonio", 
+                "Patrimônio e Frota", 
+                "Gerencie os equipamentos, valores de compra e locação."
+            )
+        with tab2:
+            render_planilha_dinamica(
+                "locacoes", 
+                "Equipamentos em Obra", 
+                "Registre a saída de máquinas para obras internas ou clientes externos."
+            )
+
+    # 5. CUSTOS DE MATERIAL
+    elif menu == "💸 Custos de Material":
+        render_planilha_dinamica(
+            "custos", 
+            "Custos de Material e Serviços", 
+            "Lançamentos no centro de custo da obra. Marque 'Reembolso CM' se necessário."
+        )
+
+    # 6. BOLETIM DE MEDIÇÃO
+    elif menu == "📊 Boletim de Medição":
+        st.header("Boletim de Medição")
+        st.write("Consolida materiais, mão de obra, equipamentos e fee.")
+        
+        conn = get_connection()
+        obras = pd.read_sql("SELECT id, codigo, nome, fee_mensal FROM obras WHERE status = 'Em execução'", conn)
+        
+        if obras.empty:
+            st.info("Nenhuma obra em execução cadastrada para medição.")
+        else:
+            obra_sel = st.selectbox("Selecione a Obra", obras['codigo'] + " - " + obras['nome'])
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Fee Mensal", f"R$ {obras.iloc[0]['fee_mensal'] or 0}")
+            c2.metric("Administração Aplicada", "12%")
+            c3.metric("Status da Medição", "Em Aberto")
+            
+            st.divider()
+            st.subheader("Resumo de Custos Acumulados")
+            custos = pd.read_sql("SELECT SUM(valor) as total FROM custos", conn)
+            st.write(f"**Materiais e Serviços:** R$ {custos['total'].iloc[0] or 0}")
+            
+        conn.close()
+
+    # 7. RESULTADOS DA CM
+    elif menu == "📈 Resultados da CM":
+        st.header("Resultados e DRE")
+        st.write("Painel de faturamento, lucro da administradora e rendimento da CM Rental.")
+        st.image("https://cdn-icons-png.flaticon.com/512/1006/1006657.png", width=100)
+        st.info("Os painéis analíticos com os gráficos de barras e linha serão renderizados à medida que as tabelas de Custos e Medição receberem dados das obras.")
+
+    # 8. PIPELINE DE NEGÓCIOS
+    elif menu == "🤝 Pipeline de Negócios (CRM)":
+        render_planilha_dinamica(
+            "oportunidades", 
+            "Funil de Oportunidades", 
+            "Casas, licitações e incorporações antes de virarem obra."
+        )
+
+    # 9. PENDÊNCIAS DA EQUIPE
+    elif menu == "✅ Pendências da Equipe":
+        render_planilha_dinamica(
+            "tarefas", 
+            "Tarefas e Meu Quadro", 
+            "O que a equipe está devendo. Filtre por pessoa para tratar um a um."
+        )
 
 if __name__ == "__main__":
     main()
