@@ -20,7 +20,7 @@ def init_db():
     # Tabelas ativas para o Data Editor
     tabelas = {
         "cargos": ["id", "nome", "abrev", "salario_base", "extras", "ordem"],
-        "equipe": ["id", "nome", "funcao_id", "salario_base", "extras", "custo_mensal", "ativo"],
+        "equipe": ["id", "nome", "funcao", "salario_base", "extras", "custo_mensal", "ativo"],
         "obras": ["id", "codigo", "nome", "cliente", "status", "regime", "fee_mensal", "orcamento"],
         "oportunidades": ["id", "nome", "cliente", "tipo", "estagio", "valor_estimado", "probabilidade"],
         "tarefas": ["id", "titulo", "responsavel", "prioridade", "status", "prazo", "descricao"],
@@ -104,10 +104,10 @@ def render_importador():
                                                    (dados.get("id"), dados.get("nome"), dados.get("abrev"), dados.get("salarioBase", 0), dados.get("extras", 0), dados.get("ordem", 99)))
                                     contagem["cargos"] += 1
                             
-                            # 2. Funcionários (Equipe)
+                            # 2. Funcionários (Equipe) - ERRO CORRIGIDO AQUI (funcao_id -> funcao)
                             elif "colecoes/funcionarios/" in caminho:
                                 if type(dados) == dict:
-                                    cursor.execute("INSERT INTO equipe (id, nome, funcao_id, salario_base, extras, ativo) VALUES (?, ?, ?, ?, ?, ?)",
+                                    cursor.execute("INSERT INTO equipe (id, nome, funcao, salario_base, extras, ativo) VALUES (?, ?, ?, ?, ?, ?)",
                                                    (dados.get("id"), dados.get("nome"), dados.get("cargoId"), dados.get("salarioBase", 0), dados.get("extras", 0), str(dados.get("ativo", True))))
                                     contagem["equipe"] += 1
                             
