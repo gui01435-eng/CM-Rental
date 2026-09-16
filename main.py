@@ -31,8 +31,16 @@ def init_db():
     
     for tabela, colunas in tabelas.items():
         try:
-            pd.read_sql(f"SELECT * FROM {tabela} LIMIT 1", conn)
+            # Verifica se a tabela existe e quais colunas ela tem
+            df_existente = pd.read_sql(f"SELECT * FROM {tabela} LIMIT 1", conn)
+            colunas_existentes = df_existente.columns.tolist()
+            
+            # Se a tabela existe, verifica se está faltando alguma coluna nova
+            for col in colunas:
+                if col not in colunas_existentes:
+                    conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {col} TEXT")
         except:
+            # Se a tabela não existir, cria do zero
             df_vazio = pd.DataFrame(columns=colunas)
             df_vazio.to_sql(tabela, conn, if_exists="replace", index=False)
             
@@ -104,7 +112,7 @@ def render_importador():
                                                    (dados.get("id"), dados.get("nome"), dados.get("abrev"), dados.get("salarioBase", 0), dados.get("extras", 0), dados.get("ordem", 99)))
                                     contagem["cargos"] += 1
                             
-                            # 2. Funcionários (Equipe) - ERRO CORRIGIDO AQUI (funcao_id -> funcao)
+                            # 2. Funcionários (Equipe)
                             elif "colecoes/funcionarios/" in caminho:
                                 if type(dados) == dict:
                                     cursor.execute("INSERT INTO equipe (id, nome, funcao, salario_base, extras, ativo) VALUES (?, ?, ?, ?, ?, ?)",
