@@ -10,7 +10,8 @@ from pathlib import Path
 # ==========================================
 st.set_page_config(page_title="CM Rental | ERP Completo", page_icon="🏗️", layout="wide")
 
-DB_PATH = Path(__file__).resolve().parent / "canteiro_cm.db"
+# Mudamos o nome do banco de dados para criar um cofre novo e limpo, sem os bloqueios do banco anterior.
+DB_PATH = Path(__file__).resolve().parent / "cm_erp_v2.db"
 
 def get_connection():
     return sqlite3.connect(DB_PATH)
@@ -31,20 +32,20 @@ def init_db():
     
     for tabela, colunas in tabelas.items():
         try:
-            # Verifica se a tabela existe e quais colunas ela tem
+            # Verifica se a tabela existe
             df_existente = pd.read_sql(f"SELECT * FROM {tabela} LIMIT 1", conn)
             colunas_existentes = df_existente.columns.tolist()
             
-            # Se a tabela existe, verifica se está faltando alguma coluna nova
+            # Se faltar alguma coluna, adiciona automaticamente
             for col in colunas:
                 if col not in colunas_existentes:
                     conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {col} TEXT")
         except:
-            # Se a tabela não existir, cria do zero
+            # Cria a tabela do zero flexível para aceitar textos e números
             df_vazio = pd.DataFrame(columns=colunas)
             df_vazio.to_sql(tabela, conn, if_exists="replace", index=False)
             
-    # Tabelas de Histórico para dados complexos (Backup JSON)
+    # Tabelas de Histórico para dados complexos (Backup JSON do sistema do irmão)
     tabelas_historico = ["historico_alocacoes", "historico_medicoes", "historico_resultados", "historico_creditos", "historico_config"]
     for th in tabelas_historico:
         conn.execute(f"CREATE TABLE IF NOT EXISTS {th} (id TEXT PRIMARY KEY, dados_json TEXT)")
@@ -76,7 +77,7 @@ def render_planilha_dinamica(tabela, titulo, subtitulo):
 # ==========================================
 def render_importador():
     st.header("📥 Importação Profunda do Sistema Antigo")
-    st.write("Faça o upload do arquivo **canteiro-cm-export-v23.zip** para migrar todo o histórico.")
+    st.write("Faça o upload do arquivo **canteiro-cm-export-v23.zip** para migrar todo o histórico para o banco de dados novo.")
     
     uploaded_file = st.file_uploader("Selecione o arquivo .zip", type=["zip"])
     
@@ -165,19 +166,18 @@ def render_importador():
                                                        (item.get("id"), item.get("nome"), item.get("obraId"), item.get("dataIni"), item.get("dataFim"), item.get("valorUnit", 0), "Ativa", item.get("valorUnit", 0) * item.get("qtd", 1)))
                                         contagem["locacoes"] += 1
                             
-                            # 9. Backup de Arquivos Complexos (Alocações, Medições, Resultados, Créditos, Config)
+                            # 9. Backup de Arquivos Complexos
                             else:
                                 pasta_mae = caminho.split("/")[-2] if len(caminho.split("/")) > 1 else ""
                                 doc_id = caminho.split("/")[-1].replace(".json", "")
                                 
-                                # Salva na tabela correspondente ao nome da pasta
                                 tabela_hist = f"historico_{pasta_mae}"
                                 if tabela_hist in ["historico_alocacoes", "historico_medicoes", "historico_resultados", "historico_creditos", "historico_config"]:
                                     cursor.execute(f"INSERT OR REPLACE INTO {tabela_hist} (id, dados_json) VALUES (?, ?)", (doc_id, json.dumps(dados)))
                                     contagem["historicos_salvos"] += 1
 
                     conn.commit()
-                    st.success("🎉 Importação total concluída com sucesso! Histórico financeiro e cadastros recuperados.")
+                    st.success("🎉 Importação total concluída com sucesso! Todo o histórico financeiro e cadastros foram recuperados para o novo banco de dados.")
                     
                     c1, c2, c3 = st.columns(3)
                     with c1:
@@ -185,7 +185,7 @@ def render_importador():
                         st.write(f"- **Funcionários:** {contagem['equipe']}")
                         st.write(f"- **Cargos:** {contagem['cargos']}")
                     with c2:
-                        st.write(f"- **Patrimônio:** {contagem['patrimonio']}")
+                        st.write(f"- **Patrimônio / Estoque:** {contagem['patrimonio']}")
                         st.write(f"- **Locações Extraídas:** {contagem['locacoes']}")
                         st.write(f"- **Custos Extraídos:** {contagem['custos']}")
                     with c3:
@@ -194,7 +194,7 @@ def render_importador():
                         st.write(f"- **Backups Complexos Salvos:** {contagem['historicos_salvos']}")
                     
                 except Exception as e:
-                    st.error(f"Erro grave ao processar o arquivo ZIP: {e}")
+                    st.error(f"Erro ao processar o arquivo ZIP: {e}")
             conn.close()
 
 # ==========================================
@@ -235,14 +235,14 @@ def main():
         render_planilha_dinamica("cargos", "Cargos", "Tabela base de cargos, salários e níveis.")
     elif menu == "📅 Calendário de Alocação":
         st.header("Calendário de Alocação")
-        st.warning("⚠️ O calendário está em processo de conversão para o novo formato de visualização de grade.")
+        st.warning("⚠️ O calendário está em processo de conversão para o novo formato de visualização de grade. Os dados foram salvos no `historico_alocacoes`.")
     elif menu == "🏗️ Pipeline de Obras":
         render_planilha_dinamica("obras", "Pipeline de Obras", "Visão geral das obras.")
     elif menu == "🚜 CM Rental (Equipamentos)":
         st.header("CM Rental | Gestão Integrada")
         tab1, tab2 = st.tabs(["Estoque / Patrimônio", "Despacho / Locações Ativas"])
         with tab1:
-            render_planilha_dinamica("patrimonio", "Patrimônio e Frota", "Gerencie os equipamentos.")
+            render_planilha_dinamica("patrimonio", "Patrimônio e Frota", "Gerencie os equipamentos e frotas.")
         with tab2:
             render_planilha_dinamica("locacoes", "Histórico de Locações", "Máquinas despachadas extraídas do seu histórico.")
     elif menu == "💸 Custos de Material":
@@ -252,9 +252,9 @@ def main():
         st.info("Os dados das medições antigas foram salvos com segurança no banco de dados (`historico_medicoes`). O painel visual será reativado em breve.")
     elif menu == "📈 Resultados da CM":
         st.header("Resultados e DRE")
-        st.info("Os resultados passados foram extraídos para o `historico_resultados`. Painel visual em desenvolvimento.")
+        st.info("Os resultados passados foram extraídos para o `historico_resultados`. O painel analítico será ativado na próxima etapa.")
     elif menu == "🤝 Pipeline de Negócios (CRM)":
-        render_planilha_dinamica("oportunidades", "Funil de Oportunidades", "Oportunidades de obras.")
+        render_planilha_dinamica("oportunidades", "Funil de Oportunidades", "Oportunidades de obras e orçamentos.")
     elif menu == "✅ Pendências da Equipe":
         render_planilha_dinamica("tarefas", "Tarefas e Meu Quadro", "O que a equipe está devendo.")
     elif menu == "📥 Importar Sistema Antigo":
