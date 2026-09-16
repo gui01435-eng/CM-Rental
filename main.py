@@ -17,7 +17,7 @@ OBRAS = ["CASA RIMAR", "CASA IM", "REFORMA GV", "HBR"]
 
 FORNECEDORES_PADRAO = [
     "Equipamento CM (Próprio)",
-    "Agaé Locações",
+    "HL Locações",
     "Loc Express",
     "Escan",
     "Outro (especificar)"
@@ -64,6 +64,7 @@ def init_db() -> None:
         if "limite_dias" not in cols_loc:
             connection.execute("ALTER TABLE locacoes ADD COLUMN limite_dias INTEGER DEFAULT 15")
 
+        # Tabela unificada para Frota e Terceiros
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS patrimonio (
@@ -73,7 +74,10 @@ def init_db() -> None:
                 data_aquisicao TEXT NOT NULL,
                 status_ativo TEXT NOT NULL DEFAULT 'Operacional',
                 intervalo_manutencao_dias INTEGER DEFAULT 30,
-                ultima_revisao TEXT
+                ultima_revisao TEXT,
+                origem_equipamento TEXT DEFAULT 'Equipamento CM (Próprio)',
+                diaria_padrao REAL DEFAULT 0,
+                mensal_padrao REAL DEFAULT 0
             )
             """
         )
@@ -85,6 +89,12 @@ def init_db() -> None:
             connection.execute("ALTER TABLE patrimonio ADD COLUMN intervalo_manutencao_dias INTEGER DEFAULT 30")
         if "ultima_revisao" not in cols_pat:
             connection.execute("ALTER TABLE patrimonio ADD COLUMN ultima_revisao TEXT")
+        if "origem_equipamento" not in cols_pat:
+            connection.execute("ALTER TABLE patrimonio ADD COLUMN origem_equipamento TEXT DEFAULT 'Equipamento CM (Próprio)'")
+        if "diaria_padrao" not in cols_pat:
+            connection.execute("ALTER TABLE patrimonio ADD COLUMN diaria_padrao REAL DEFAULT 0")
+        if "mensal_padrao" not in cols_pat:
+            connection.execute("ALTER TABLE patrimonio ADD COLUMN mensal_padrao REAL DEFAULT 0")
 
         connection.execute(
             """
@@ -185,18 +195,6 @@ def concluir_manutencao_mes(cronograma_id: int, data_conclusao: date, custo: flo
             connection.commit()
 
 
-def ensure_patrimonio_exists(equipamento: str, data_retirada: str) -> None:
-    with get_connection() as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO patrimonio (equipamento, valor_aquisicao, data_aquisicao, status_ativo, intervalo_manutencao_dias, ultima_revisao)
-            VALUES (?, 0, ?, 'Operacional', 30, ?)
-            """,
-            (equipamento.strip(), data_retirada, data_retirada),
-        )
-        connection.commit()
-
-
 def update_patrimonio_dados(equipamento: str, valor: float, data_aquisicao: str, intervalo_dias: int) -> None:
     with get_connection() as connection:
         connection.execute(
@@ -285,9 +283,6 @@ def create_rental(
         )
         connection.commit()
 
-    if tipo_origem == "Próprio (CM)":
-        ensure_patrimonio_exists(equipamento, data_retirada.isoformat())
-
 
 def close_rental(rental_id: int) -> None:
     with get_connection() as connection:
@@ -368,12 +363,9 @@ def gerar_link_whatsapp(telefone: str, mensagem: str) -> str:
 
 def gerar_link_google_agenda(equipamento: str, ano: int, mes: int, obs: str) -> str:
     hoje = date.today()
-    # Define a data do evento para facilitar o lembrete
     if hoje.year == ano and hoje.month == mes:
-        # Se for para este mês, bota para amanha
         data_evento = hoje + timedelta(days=1)
     else:
-        # Se for pra outro mês, joga no dia 5 do mês correspondente
         try:
             data_evento = date(ano, mes, 5)
         except ValueError:
@@ -398,7 +390,8 @@ def render_sidebar() -> str:
     menu = st.sidebar.radio(
         "Menu Principal",
         [
-            "Nova Locação",
+            "Cadastro de Equipamentos",
+            "Nova Locação (Despacho)",
             "Equipamentos Alugados",
             "Plano Anual de Manutenção",
             "Manutenção & Sinistros",
@@ -419,84 +412,114 @@ def render_sidebar() -> str:
     return menu
 
 
-def render_new_rental() -> None:
-    st.title("Nova Locação")
-    st.write("Registre a saída de máquinas para obras internas ou clientes externos.")
+def render_cadastro_equipamentos() -> None:
+    st.title("Cadastro de Equipamentos (Estoque)")
+    st.write("Registre o maquinário próprio (CM) ou de locadoras parceiras para agilizar os despachos.")
 
-    patrimonio_df = load_patrimonio()
-    equipamentos_disponiveis = []
-    if not patrimonio_df.empty:
-        operacionais = patrimonio_df[patrimonio_df["status_ativo"] == "Operacional"]
-        equipamentos_disponiveis = operacionais["equipamento"].tolist()
-
-    with st.form("new_rental_form", clear_on_submit=True):
-        st.subheader("1. Identificação e Origem")
-        col_one, col_two = st.columns(2)
-        with col_one:
-            origem_sel = st.selectbox("Origem do Equipamento / Fornecedor", FORNECEDORES_PADRAO)
-            
+    with st.form("form_cad_eq", clear_on_submit=True):
+        st.subheader("Inserir Novo Equipamento")
+        c1, c2 = st.columns(2)
+        with c1:
+            nome_eq = st.text_input("Identificação / Nome", placeholder="Ex.: Betoneira 400L 01")
+            origem_sel = st.selectbox("Origem / Proprietário", FORNECEDORES_PADRAO)
             fornecedor_custom = ""
             if origem_sel == "Outro (especificar)":
-                fornecedor_custom = st.text_input("Digite o nome do fornecedor:")
-
-            if origem_sel == "Equipamento CM (Próprio)":
-                st.caption("💡 Escolha da frota própria operacional ou digite um novo:")
-                escolha_sugestao = st.selectbox(
-                    "Frota CM",
-                    ["[DIGITAR NOVO / OUTRO]"] + equipamentos_disponiveis,
-                )
-                if escolha_sugestao == "[DIGITAR NOVO / OUTRO]":
-                    equipamento = st.text_input("Nome do novo equipamento CM:", placeholder="Ex.: Betoneira 400L 03")
-                else:
-                    equipamento = escolha_sugestao
-            else:
-                equipamento = st.text_input(
-                    "Nome do Equipamento",
-                    placeholder="Ex.: Martelete 15kg, Andaime Fachadeiro",
-                )
-
-            obra = st.selectbox("Obra / Destino", OBRAS)
+                fornecedor_custom = st.text_input("Nome do parceiro/fornecedor:")
             
-        with col_two:
-            data_retirada = st.date_input("Data de Saída / Início", value=date.today(), format="DD/MM/YYYY")
+        with c2:
+            val_compra = st.number_input("Valor de Compra (R$) - Preencha apenas se for CM", min_value=0.0, step=100.0, format="%.2f")
+            val_diaria = st.number_input("Valor Padrão da Diária (R$)", min_value=0.0, step=5.0, format="%.2f")
+            val_mensal = st.number_input("Valor Padrão Mensal (R$)", min_value=0.0, step=50.0, format="%.2f")
+            dt_aq = st.date_input("Data de Aquisição / Entrada", format="DD/MM/YYYY")
+
+        sub = st.form_submit_button("Salvar no Estoque", type="primary", use_container_width=True)
+        if sub:
+            if not nome_eq.strip():
+                st.error("Por favor, preencha a identificação do equipamento.")
+            else:
+                forn_final = fornecedor_custom.strip() if origem_sel == "Outro (especificar)" else origem_sel
+                try:
+                    with get_connection() as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO patrimonio 
+                            (equipamento, valor_aquisicao, data_aquisicao, status_ativo, intervalo_manutencao_dias, origem_equipamento, diaria_padrao, mensal_padrao)
+                            VALUES (?, ?, ?, 'Operacional', 30, ?, ?, ?)
+                            """,
+                            (nome_eq.strip(), val_compra, dt_aq.isoformat(), forn_final, val_diaria, val_mensal)
+                        )
+                        conn.commit()
+                    st.success(f"Equipamento '{nome_eq}' cadastrado com sucesso!")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("Erro: Já existe um equipamento cadastrado com esse nome exato.")
+
+    st.divider()
+    st.subheader("Lista de Equipamentos Cadastrados")
+    df_eq = load_patrimonio()
+    if not df_eq.empty:
+        show_df = df_eq[["equipamento", "origem_equipamento", "status_ativo", "diaria_padrao", "mensal_padrao", "valor_aquisicao"]].copy()
+        show_df.columns = ["Equipamento", "Origem/Dono", "Status", "Diária (R$)", "Mensal (R$)", "Custo Aquisição (R$)"]
+        show_df["Diária (R$)"] = show_df["Diária (R$)"].map(format_currency)
+        show_df["Mensal (R$)"] = show_df["Mensal (R$)"].map(format_currency)
+        show_df["Custo Aquisição (R$)"] = show_df["Custo Aquisição (R$)"].map(format_currency)
+        st.dataframe(show_df, hide_index=True, use_container_width=True)
+    else:
+        st.info("Nenhum equipamento registrado ainda.")
+
+
+def render_new_rental() -> None:
+    st.title("Nova Locação (Despacho)")
+    st.write("Despache um equipamento do seu estoque para a obra.")
+
+    df_eq = load_patrimonio()
+    if df_eq.empty:
+        st.warning("⚠️ Seu estoque está vazio! Vá primeiro na aba 'Cadastro de Equipamentos' para registrar as máquinas.")
+        return
+        
+    disponiveis = df_eq[df_eq["status_ativo"] == "Operacional"]
+    if disponiveis.empty:
+        st.warning("Nenhum equipamento operacional disponível no momento.")
+        return
+
+    st.subheader("1. Selecione o Equipamento")
+    # Colocando o seletor fora do form, o sistema consegue atualizar os valores padrão automaticamente!
+    eq_selecionado = st.selectbox("Máquina Disponível no Estoque:", disponiveis["equipamento"].tolist())
+    
+    linha_eq = disponiveis[disponiveis["equipamento"] == eq_selecionado].iloc[0]
+    origem_eq = linha_eq["origem_equipamento"]
+    diaria_pad = float(linha_eq.get("diaria_padrao", 0.0))
+    mensal_pad = float(linha_eq.get("mensal_padrao", 0.0))
+
+    with st.form("new_rental_form", clear_on_submit=True):
+        st.info(f"📌 **Origem/Proprietário:** {origem_eq}")
+        c1, c2 = st.columns(2)
+        with c1:
+            obra = st.selectbox("Obra / Destino", OBRAS)
+            data_retirada = st.date_input("Data de Saída / Retirada", value=date.today(), format="DD/MM/YYYY")
+        with c2:
             data_devolucao = st.date_input("Previsão de Devolução", value=date.today() + timedelta(days=7), format="DD/MM/YYYY")
-
+        
         st.subheader("2. Regimes e Valores de Cobrança")
-        col_c1, col_c2, col_c3 = st.columns(3)
-        with col_c1:
-            custo_diario = st.number_input("Diária (R$)", min_value=0.0, step=5.0, format="%.2f")
-        with col_c2:
-            custo_mensal = st.number_input(
-                "Valor Mensal (R$)", min_value=0.0, step=50.0, format="%.2f",
-                help="Se contratado por mês ou com conversão automática."
-            )
-        with col_c3:
-            limite_dias = st.number_input(
-                "Dias p/ virar mês cheio", min_value=1, max_value=30, value=15,
-                help="Ex: Se ultrapassar 15 dias fracionados, fecha o mês cheio."
-            )
+        st.caption("Esses valores foram preenchidos automaticamente com base no cadastro, mas você pode ajustá-los se precisar.")
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            custo_diario = st.number_input("Diária (R$)", value=diaria_pad, step=5.0, format="%.2f")
+        with c4:
+            custo_mensal = st.number_input("Mensal (R$)", value=mensal_pad, step=50.0, format="%.2f")
+        with c5:
+            limite_dias = st.number_input("Dias p/ virar mês cheio", min_value=1, max_value=30, value=15)
+        
+        submit = st.form_submit_button("Despachar Equipamento", type="primary", use_container_width=True)
 
-        submitted = st.form_submit_button("Registrar Locação", type="primary", use_container_width=True)
-
-    if submitted:
-        if origem_sel == "Outro (especificar)":
-            fornecedor_final = fornecedor_custom.strip() if fornecedor_custom.strip() else "Outro"
-            tipo_origem = "Terceiros"
-        elif origem_sel == "Equipamento CM (Próprio)":
-            fornecedor_final = "CM (Próprio)"
-            tipo_origem = "Próprio (CM)"
-        else:
-            fornecedor_final = origem_sel
-            tipo_origem = "Terceiros"
-
-        if not equipamento.strip():
-            st.error("Informe a identificação do equipamento.")
-        elif data_devolucao < data_retirada:
+    if submit:
+        if data_devolucao < data_retirada:
             st.error("A data de devolução deve ser igual ou posterior à retirada.")
         else:
+            tipo_origem = "Próprio (CM)" if origem_eq == "Equipamento CM (Próprio)" else "Terceiros"
             create_rental(
-                equipamento=equipamento,
-                fornecedor=fornecedor_final,
+                equipamento=eq_selecionado,
+                fornecedor=origem_eq,
                 tipo_origem=tipo_origem,
                 obra=obra,
                 data_retirada=data_retirada,
@@ -505,7 +528,7 @@ def render_new_rental() -> None:
                 custo_mensal=custo_mensal,
                 limite_dias=int(limite_dias),
             )
-            st.success(f"Equipamento '{equipamento}' ({tipo_origem}) lançado com sucesso!")
+            st.success(f"Equipamento '{eq_selecionado}' despachado para {obra} com sucesso!")
             st.rerun()
 
 
@@ -566,23 +589,22 @@ def render_active_rentals() -> None:
 
 def render_plano_anual() -> None:
     st.title("Plano Anual de Manutenção Preventiva")
-    st.write(
-        "Visão em planilha anual do plano de revisões periódicas da frota própria CM, "
-        "com controle de pendências e integração com WhatsApp e Google Agenda."
-    )
+    st.write("Visão em planilha anual do plano de revisões periódicas da frota própria CM.")
 
     patrimonio_df = load_patrimonio()
-    if patrimonio_df.empty:
-        st.info("Nenhum equipamento próprio cadastrado ainda.")
+    # Filtra apenas os que são da própria CM para o plano de manutenção
+    pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
+    
+    if pat_cm.empty:
+        st.info("Nenhum equipamento próprio CM cadastrado no estoque ainda.")
         return
 
-    equipamentos_ativos = patrimonio_df[patrimonio_df["status_ativo"] != "Baixado / Perda"]["equipamento"].tolist()
+    equipamentos_ativos = pat_cm[pat_cm["status_ativo"] != "Baixado / Perda"]["equipamento"].tolist()
 
     ano_atual = date.today().year
     mes_atual = date.today().month
     ano_sel = st.selectbox("Ano de Referência do Plano", [ano_atual, ano_atual + 1], index=0)
 
-    # 1. Agendamento
     with st.expander("📅 Agendar ou Programar Manutenção para um Mês"):
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
@@ -590,7 +612,7 @@ def render_plano_anual() -> None:
         with c2:
             mes_agendar = st.selectbox("Mês Programado:", range(1, 13), format_func=lambda m: MESES_NOMES[m - 1], index=mes_atual - 1)
         with c3:
-            obs_agendar = st.text_input("Observação / Itens a revisar:", placeholder="Troca de óleo, checagem elétrica, engraxar")
+            obs_agendar = st.text_input("Observação / Itens a revisar:", placeholder="Troca de óleo, checagem elétrica")
         
         if st.button("Gravar no Plano", type="primary"):
             agendar_manutencao_mes(eq_agendar, ano_sel, mes_agendar, obs_agendar)
@@ -599,7 +621,6 @@ def render_plano_anual() -> None:
 
     cronograma_df = load_cronograma(ano_sel)
 
-    # 2. Planilha Anual (Matriz)
     st.subheader(f"Planilha de Manutenções Preventivas - {ano_sel}")
     matriz_dados = []
     for eq in equipamentos_ativos:
@@ -625,8 +646,6 @@ def render_plano_anual() -> None:
     st.dataframe(df_matriz, hide_index=True, use_container_width=True)
 
     st.divider()
-
-    # 3. Lembretes e Integrações
     st.subheader(f"⚠️ Lembretes de Manutenção e Cobrança ({MESES_NOMES[mes_atual - 1]}/{ano_atual})")
 
     pendencias = cronograma_df[
@@ -639,7 +658,6 @@ def render_plano_anual() -> None:
         st.success("🎉 Nenhuma manutenção preventiva atrasada ou pendente para este mês!")
     else:
         st.warning(f"Existem **{len(pendencias)} manutenção(ões)** pendentes de execução!")
-        st.caption("Você pode configurar o alerta no seu celular ou mandar a cobrança para o responsável.")
         tel_cobranca = st.text_input("WhatsApp do Encarregado (com DDD):", value="5584999999999")
 
         for _, item in pendencias.iterrows():
@@ -668,24 +686,25 @@ def render_plano_anual() -> None:
                 st.link_button("📲 Cobrar WPP", link_wa)
                 
             with c_card4:
-                # O BOTÃO MÁGICO DO GOOGLE AGENDA
                 link_agenda = gerar_link_google_agenda(item['equipamento'], item['ano'], item['mes'], item['observacoes'] or "")
-                st.link_button("📅 Criar Alerta", link_agenda, help="Salva no seu Google Agenda para o celular te lembrar automaticamente.")
+                st.link_button("📅 Criar Alerta", link_agenda, help="Salva no seu Google Agenda.")
 
 
 def render_manutencoes() -> None:
     st.title("Manutenção, Consertos e Perdas")
-    st.write("Registre sinistros, quebras, envios para conserto e perdas materiais para apurar o custo real.")
+    st.write("Registre sinistros, quebras, envios para conserto e perdas materiais da frota CM.")
 
     patrimonio_df = load_patrimonio()
-    if patrimonio_df.empty:
-        st.warning("Cadastre primeiro os equipamentos CM para poder vincular os registros de manutenção.")
+    pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
+    
+    if pat_cm.empty:
+        st.warning("Cadastre primeiro os equipamentos na aba 'Cadastro de Equipamentos'.")
         return
 
-    na_oficina = patrimonio_df[patrimonio_df["status_ativo"] == "Em Oficina"]
+    na_oficina = pat_cm[pat_cm["status_ativo"] == "Em Oficina"]
     if not na_oficina.empty:
         with st.expander("🛠️ Máquinas Atualmente em Conserto / Na Oficina", expanded=True):
-            st.info("Essas máquinas estão indisponíveis para locação. Ao voltarem prontas da oficina, libere-as abaixo:")
+            st.info("Libere as máquinas que voltaram da oficina para poderem ser locadas novamente:")
             c_of1, c_of2, c_of3 = st.columns([2, 1, 1])
             with c_of1:
                 eq_lib = st.selectbox("Equipamento pronto:", na_oficina["equipamento"].tolist())
@@ -703,7 +722,7 @@ def render_manutencoes() -> None:
         st.subheader("Registrar Ocorrência / Conserto / Perda")
         col1, col2 = st.columns(2)
         with col1:
-            eq_alvo = st.selectbox("Equipamento CM", patrimonio_df["equipamento"].tolist())
+            eq_alvo = st.selectbox("Equipamento CM", pat_cm["equipamento"].tolist())
             tipo_ev = st.selectbox(
                 "Tipo de Ocorrência",
                 [
@@ -719,7 +738,7 @@ def render_manutencoes() -> None:
             prestador = st.text_input("Oficina / Prestador de Serviço", placeholder="Ex.: Motores & Cia, Oficina HL, Interno")
             motivo = st.text_area(
                 "Diagnóstico / O que aconteceu?",
-                placeholder="Ex.: Motor queimou por trabalhar em 220V em tomada errada; Troca de rolamentos e induzido; Furto no canteiro.",
+                placeholder="Ex.: Motor queimou por trabalhar em 220V em tomada errada; Troca de rolamentos e induzido.",
             )
 
         submit_ev = st.form_submit_button("Lançar Ocorrência", type="primary", use_container_width=True)
@@ -756,29 +775,30 @@ def render_manutencoes() -> None:
 
 def render_patrimonio_lucro() -> None:
     st.title("Patrimônio & Lucro Real por Máquina")
-    st.write("Visão financeira individual: quanto a máquina custou, quanto já faturou, quanto gastou de conserto e o lucro líquido real.")
+    st.write("Visão financeira individual: quanto a máquina da CM custou, quanto faturou, quanto gastou e o lucro líquido real.")
 
     patrimonio_df = load_patrimonio()
+    pat_cm = patrimonio_df[patrimonio_df["origem_equipamento"] == "Equipamento CM (Próprio)"]
 
-    if not patrimonio_df.empty:
-        with st.expander("✏️ Atualizar Valor de Compra & Ciclo de Manutenção"):
+    if not pat_cm.empty:
+        with st.expander("✏️ Ajustar Valor de Compra & Ciclo de Manutenção"):
             col1, col2, col3 = st.columns([2, 1, 1])
             with col1:
-                eq_sel = st.selectbox("Selecione o equipamento:", patrimonio_df["equipamento"].tolist())
-            linha = patrimonio_df[patrimonio_df["equipamento"] == eq_sel].iloc[0]
+                eq_sel = st.selectbox("Selecione o equipamento:", pat_cm["equipamento"].tolist())
+            linha = pat_cm[pat_cm["equipamento"] == eq_sel].iloc[0]
             with col2:
                 v_compra = st.number_input("Valor de Compra (R$)", value=float(linha["valor_aquisicao"]), step=100.0, format="%.2f")
             with col3:
                 interv = st.number_input("Periodicidade Revisão (Dias)", value=int(linha.get("intervalo_manutencao_dias", 30)), step=5)
             dt_aq = st.date_input("Data de Aquisição", value=as_date(linha["data_aquisicao"]), format="DD/MM/YYYY")
 
-            if st.button("Salvar Ajustes do Ativo", type="primary"):
+            if st.button("Salvar Ajustes", type="primary"):
                 update_patrimonio_dados(eq_sel, v_compra, dt_aq.isoformat(), int(interv))
                 st.success("Dados atualizados com sucesso!")
                 st.rerun()
 
-    if patrimonio_df.empty:
-        st.info("Nenhum equipamento registrado no patrimônio ainda.")
+    if pat_cm.empty:
+        st.info("Nenhum equipamento próprio CM registrado no estoque ainda.")
         return
 
     st.divider()
@@ -792,7 +812,7 @@ def render_patrimonio_lucro() -> None:
     gastos_oficina = manut_df.groupby("equipamento")["custo"].sum().reset_index()
     gastos_oficina.rename(columns={"custo": "custo_manutencoes"}, inplace=True)
 
-    dre_maquinas = pd.merge(patrimonio_df, ganhos, on="equipamento", how="left").fillna(0.0)
+    dre_maquinas = pd.merge(pat_cm, ganhos, on="equipamento", how="left").fillna(0.0)
     dre_maquinas = pd.merge(dre_maquinas, gastos_oficina, on="equipamento", how="left").fillna(0.0)
 
     dre_maquinas["lucro_operacional"] = dre_maquinas["faturamento_bruto"] - dre_maquinas["custo_manutencoes"]
@@ -937,7 +957,9 @@ def main() -> None:
     init_db()
     menu = render_sidebar()
 
-    if menu == "Nova Locação":
+    if menu == "Cadastro de Equipamentos":
+        render_cadastro_equipamentos()
+    elif menu == "Nova Locação (Despacho)":
         render_new_rental()
     elif menu == "Equipamentos Alugados":
         render_active_rentals()
