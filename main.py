@@ -17,7 +17,7 @@ OBRAS = ["CASA RIMAR", "CASA IM", "REFORMA GV", "HBR"]
 
 FORNECEDORES_PADRAO = [
     "Equipamento CM (Próprio)",
-    "HL Locações",
+    "Agaé Locações",
     "Loc Express",
     "Escan",
     "Outro (especificar)"
